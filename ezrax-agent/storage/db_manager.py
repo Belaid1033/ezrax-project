@@ -17,19 +17,19 @@ from typing import Dict, List, Tuple, Any, Optional, Union
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
-import weakref
 
 logger = logging.getLogger(__name__)
 
 class ConnectionPool:
-    """Pool de connexions SQLite optimisé pour les performances"""
+    """Pool de connexions SQLite optimisé pour les performances - Version corrigée"""
     
     def __init__(self, db_path: str, pool_size: int = 5, timeout: float = 30.0):
         self.db_path = db_path
         self.pool_size = pool_size
         self.timeout = timeout
         self.pool = queue.Queue(maxsize=pool_size)
-        self.active_connections = weakref.WeakSet()
+        # CORRIGÉ: Utiliser un set normal au lieu de WeakSet pour SQLite
+        self.active_connections = set()
         self.lock = threading.Lock()
         self.total_connections = 0
         
@@ -83,7 +83,9 @@ class ConnectionPool:
                 if not conn:
                     raise RuntimeError("Impossible de créer une connexion à la base de données")
                     
-            self.active_connections.add(conn)
+            # CORRIGÉ: Gérer l'ajout/suppression des connexions actives de manière sûre
+            with self.lock:
+                self.active_connections.add(id(conn))  # Utiliser l'ID au lieu de l'objet
             yield conn
             
         except Exception as e:
@@ -99,6 +101,10 @@ class ConnectionPool:
         finally:
             if conn:
                 try:
+                    # CORRIGÉ: Supprimer l'ID de la connexion
+                    with self.lock:
+                        self.active_connections.discard(id(conn))
+                    
                     # Remettre la connexion dans le pool si elle est saine
                     if self.pool.qsize() < self.pool_size:
                         self.pool.put(conn)
@@ -116,12 +122,9 @@ class ConnectionPool:
             except:
                 pass
                 
-        # Fermer les connexions actives
-        for conn in list(self.active_connections):
-            try:
-                conn.close()
-            except:
-                pass
+        # Les connexions actives se fermeront automatiquement
+        with self.lock:
+            self.active_connections.clear()
                 
         logger.info(f"Pool de connexions fermé ({self.total_connections} connexions)")
 
@@ -200,7 +203,7 @@ class QueryCache:
 
 class DatabaseManager:
     """
-    Gestionnaire de base de données SQLite ultra-optimisé pour l'agent EZRAX
+    Gestionnaire de base de données SQLite ultra-optimisé pour l'agent EZRAX - Version corrigée
     """
     
     def __init__(self, config):
@@ -415,15 +418,6 @@ class DatabaseManager:
                       details: Dict[str, Any]) -> bool:
         """
         Ajoute un log d'attaque à la base de données - Version optimisée
-        
-        Args:
-            attack_type: Type d'attaque
-            source_ip: Adresse IP source
-            scanner: Nom du scanner qui a détecté l'attaque
-            details: Détails de l'attaque
-            
-        Returns:
-            True si ajouté avec succès, False sinon
         """
         start_time = time.time()
         
@@ -469,15 +463,6 @@ class DatabaseManager:
     def add_blocked_ip(self, ip: str, reason: str, timestamp: float, duration: int) -> bool:
         """
         Ajoute une IP bloquée à la base de données - Version optimisée
-        
-        Args:
-            ip: Adresse IP bloquée
-            reason: Raison du blocage
-            timestamp: Timestamp du blocage
-            duration: Durée du blocage en secondes
-            
-        Returns:
-            True si ajouté avec succès, False sinon
         """
         start_time = time.time()
         
@@ -531,14 +516,6 @@ class DatabaseManager:
                        since: Optional[float] = None) -> List[Dict[str, Any]]:
         """
         Récupère les logs d'attaques - Version ultra-optimisée avec cache
-        
-        Args:
-            limit: Nombre maximum de logs à récupérer
-            offset: Décalage pour la pagination
-            since: Timestamp à partir duquel récupérer les logs
-            
-        Returns:
-            Liste des logs d'attaques
         """
         start_time = time.time()
         
@@ -606,12 +583,6 @@ class DatabaseManager:
     def get_blocked_ips(self, include_expired: bool = False) -> List[Dict[str, Any]]:
         """
         Récupère la liste des IPs bloquées - Version optimisée
-        
-        Args:
-            include_expired: Inclure les IPs dont le blocage a expiré
-            
-        Returns:
-            Liste des IPs bloquées
         """
         start_time = time.time()
         
@@ -663,12 +634,6 @@ class DatabaseManager:
     def get_unsynced_data(self, max_records: int = 100) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """
         Récupère les données non synchronisées - Version parallélisée
-        
-        Args:
-            max_records: Nombre maximum d'enregistrements à récupérer
-            
-        Returns:
-            Tuple contenant les logs d'attaques et les IPs bloquées non synchronisés
         """
         start_time = time.time()
         
@@ -727,13 +692,6 @@ class DatabaseManager:
     def mark_as_synced(self, attack_log_ids: List[int], blocked_ip_ids: List[int]) -> bool:
         """
         Marque les données comme synchronisées - Version optimisée avec transactions
-        
-        Args:
-            attack_log_ids: Liste des IDs de logs d'attaques à marquer
-            blocked_ip_ids: Liste des IDs d'IPs bloquées à marquer
-            
-        Returns:
-            True si réussi, False sinon
         """
         if not attack_log_ids and not blocked_ip_ids:
             return True
@@ -841,22 +799,6 @@ class DatabaseManager:
             logger.error(f"Erreur lors du nettoyage des données: {e}")
             self.metrics["errors"] += 1
             
-    def get_performance_metrics(self) -> Dict[str, Any]:
-        """Retourne les métriques de performance de la base de données"""
-        pool_stats = {
-            "pool_size": self.connection_pool.pool_size,
-            "active_connections": len(self.connection_pool.active_connections),
-            "total_connections_created": self.connection_pool.total_connections
-        }
-        
-        cache_stats = self.query_cache.get_stats()
-        
-        return {
-            **self.metrics,
-            "connection_pool": pool_stats,
-            "query_cache": cache_stats
-        }
-        
     def _update_query_metrics(self, query_time: float):
         """Met à jour les métriques de performance des requêtes"""
         self.metrics["queries_executed"] += 1
@@ -876,69 +818,22 @@ class DatabaseManager:
             self.metrics["slow_queries"] += 1
             logger.warning(f"Requête lente détectée: {query_time:.2f}s")
             
-    def optimize_database(self):
-        """Lance une optimisation complète de la base de données"""
-        logger.info("Optimisation complète de la base de données...")
-        start_time = time.time()
+    def get_performance_metrics(self) -> Dict[str, Any]:
+        """Retourne les métriques de performance de la base de données"""
+        pool_stats = {
+            "pool_size": self.connection_pool.pool_size,
+            "active_connections": len(self.connection_pool.active_connections),
+            "total_connections_created": self.connection_pool.total_connections
+        }
         
-        try:
-            with self.connection_pool.get_connection() as conn:
-                cursor = conn.cursor()
-                
-                # Analyser les statistiques
-                cursor.execute('ANALYZE')
-                
-                # Optimiser
-                cursor.execute('PRAGMA optimize')
-                
-                # Vérifier l'intégrité
-                cursor.execute('PRAGMA integrity_check')
-                integrity_result = cursor.fetchone()[0]
-                
-                if integrity_result != "ok":
-                    logger.error(f"Problème d'intégrité détecté: {integrity_result}")
-                else:
-                    logger.info("Intégrité de la base de données vérifiée")
-                    
-                # Recalculer les statistiques des pages
-                cursor.execute('PRAGMA page_count')
-                page_count = cursor.fetchone()[0]
-                
-                cursor.execute('PRAGMA freelist_count')
-                free_pages = cursor.fetchone()[0]
-                
-                utilization = ((page_count - free_pages) / page_count * 100) if page_count > 0 else 0
-                
-                optimization_time = time.time() - start_time
-                
-                logger.info(
-                    f"Optimisation terminée en {optimization_time:.2f}s - "
-                    f"Pages: {page_count}, Libres: {free_pages}, "
-                    f"Utilisation: {utilization:.1f}%"
-                )
-                
-        except Exception as e:
-            logger.error(f"Erreur lors de l'optimisation: {e}")
-            
-    def close(self):
-        """Ferme proprement la base de données et tous les composants"""
-        logger.info("Fermeture du gestionnaire de base de données")
+        cache_stats = self.query_cache.get_stats()
         
-        try:
-            # Arrêter l'executor
-            self.executor.shutdown(wait=True, timeout=10)
-            
-            # Fermer le pool de connexions
-            self.connection_pool.close_all()
-            
-            # Log des métriques finales
-            metrics = self.get_performance_metrics()
-            logger.info(f"Métriques finales de la base de données: {metrics}")
-            
-        except Exception as e:
-            logger.error(f"Erreur lors de la fermeture: {e}")
-            
-    # Méthodes héritées adaptées (autres méthodes de l'ancienne version)
+        return {
+            **self.metrics,
+            "connection_pool": pool_stats,
+            "query_cache": cache_stats
+        }
+        
     def update_block_end_time(self, ip: str) -> bool:
         """Met à jour le temps de fin de blocage d'une IP"""
         end_time = time.time()
@@ -1073,3 +968,51 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Erreur lors de la récupération de l'état: {e}")
             return default
+            
+    def close(self):
+        """Ferme proprement la base de données et tous les composants"""
+        logger.info("Fermeture du gestionnaire de base de données")
+        
+        try:
+            # Arrêter l'executor
+            self.executor.shutdown(wait=True, timeout=10)
+            
+            # Fermer le pool de connexions
+            self.connection_pool.close_all()
+            
+            # Log des métriques finales
+            metrics = self.get_performance_metrics()
+            logger.info(f"Métriques finales de la base de données: {metrics}")
+            
+        except Exception as e:
+            logger.error(f"Erreur lors de la fermeture: {e}")
+            
+    def optimize_database(self):
+        """Lance une optimisation complète de la base de données"""
+        logger.info("Optimisation complète de la base de données...")
+        start_time = time.time()
+        
+        try:
+            with self.connection_pool.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                # Analyser les statistiques
+                cursor.execute('ANALYZE')
+                
+                # Optimiser
+                cursor.execute('PRAGMA optimize')
+                
+                # Vérifier l'intégrité
+                cursor.execute('PRAGMA integrity_check')
+                integrity_result = cursor.fetchone()[0]
+                
+                if integrity_result != "ok":
+                    logger.error(f"Problème d'intégrité détecté: {integrity_result}")
+                else:
+                    logger.info("Intégrité de la base de données vérifiée")
+                    
+                optimization_time = time.time() - start_time
+                logger.info(f"Optimisation terminée en {optimization_time:.2f}s")
+                
+        except Exception as e:
+            logger.error(f"Erreur lors de l'optimisation: {e}")

@@ -10,10 +10,11 @@ import uuid
 import yaml
 import socket
 import logging
-import logging.handlers  # FIXÉ: Import ajouté
+import logging.handlers
 import ipaddress
 import secrets
 import hashlib
+import subprocess
 from pathlib import Path
 from typing import Dict, Any, List, Union, Optional
 from dotenv import load_dotenv
@@ -91,10 +92,67 @@ class ConfigValidator:
             return bool(value)
             
     @staticmethod
+    def get_active_network_interface() -> str:
+        """Détecte l'interface réseau active"""
+        try:
+            # Méthode 1: via route par défaut
+            result = subprocess.run(
+                ['ip', 'route', 'get', '8.8.8.8'], 
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                import re
+                match = re.search(r'dev (\S+)', result.stdout)
+                if match:
+                    interface = match.group(1)
+                    logger.info(f"Interface active détectée: {interface}")
+                    return interface
+        except:
+            pass
+            
+        try:
+            # Méthode 2: via les interfaces UP
+            result = subprocess.run(
+                ['ip', 'link', 'show'], 
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                import re
+                interfaces = re.findall(r'\d+: (\w+).*state UP', result.stdout)
+                # Filtrer les interfaces loopback
+                non_lo_interfaces = [iface for iface in interfaces if not iface.startswith('lo')]
+                if non_lo_interfaces:
+                    interface = non_lo_interfaces[0]
+                    logger.info(f"Interface UP détectée: {interface}")
+                    return interface
+        except:
+            pass
+            
+        # Méthode 3: interfaces communes
+        common_interfaces = ['enp0s3', 'enp0s8', 'ens33', 'ens18', 'eth0', 'wlan0']
+        try:
+            import psutil
+            available_interfaces = list(psutil.net_if_addrs().keys())
+            for iface in common_interfaces:
+                if iface in available_interfaces:
+                    logger.info(f"Interface commune trouvée: {iface}")
+                    return iface
+        except ImportError:
+            pass
+            
+        logger.warning("Impossible de détecter l'interface réseau, utilisation d'enp0s3 par défaut")
+        return "enp0s3"
+            
+    @staticmethod
     def validate_interfaces_list(interfaces: Union[str, List[str]]) -> List[str]:
         """Valide une liste d'interfaces réseau"""
         if isinstance(interfaces, str):
             interfaces = [iface.strip() for iface in interfaces.split(",") if iface.strip()]
+            
+        # Si la liste est vide ou contient seulement des interfaces par défaut, détecter automatiquement
+        if not interfaces or (len(interfaces) == 1 and interfaces[0] in ['eth0', 'enp0s3']):
+            active_interface = ConfigValidator.get_active_network_interface()
+            return [active_interface]
             
         # Récupérer les interfaces disponibles
         try:
@@ -111,16 +169,10 @@ class ConfigValidator:
             else:
                 logger.warning(f"Interface réseau inexistante ignorée: {iface}")
                 
-        # Si aucune interface valide, utiliser une interface par défaut
+        # Si aucune interface valide, utiliser l'interface active détectée
         if not validated_interfaces:
-            if available_interfaces:
-                # Prendre la première interface non-loopback
-                for iface in available_interfaces:
-                    if not iface.startswith("lo"):
-                        validated_interfaces.append(iface)
-                        break
-            if not validated_interfaces:
-                validated_interfaces.append("any")
+            active_interface = ConfigValidator.get_active_network_interface()
+            validated_interfaces.append(active_interface)
                 
         return validated_interfaces
 
@@ -243,7 +295,7 @@ def get_default_config() -> Dict[str, Any]:
                     os.environ.get("SYN_FLOOD_WINDOW", 5), min_value=1
                 ),
                 "interfaces": ConfigValidator.validate_interfaces_list(
-                    os.environ.get("MONITOR_INTERFACES", "eth0,enp0s3")
+                    os.environ.get("MONITOR_INTERFACES", "auto")
                 ),
             },
             "udp_flood": {
@@ -385,14 +437,14 @@ def validate_full_config(config: Dict[str, Any]) -> bool:
                     os.makedirs(parent_dir, exist_ok=True)
                     logger.info(f"Répertoire créé: {parent_dir}")
                     
-        # Valider la connectivité au serveur central (optionnel)
+        # Test de connectivité au serveur central (simplifié)
         if config["central_server"]["enabled"] if "enabled" in config["central_server"] else True:
             host = config["central_server"]["host"]
             port = config["central_server"]["port"]
             
-            # Test de résolution DNS (non bloquant)
+            # Test de résolution DNS simple (sans timeout)
             try:
-                socket.getaddrinfo(host, port, timeout=2)
+                socket.getaddrinfo(host, port)
                 logger.info(f"Serveur central accessible: {host}:{port}")
             except (socket.gaierror, socket.timeout):
                 logger.warning(f"Serveur central non accessible: {host}:{port}")
@@ -558,8 +610,11 @@ def save_config_template():
     template_path = os.path.join(BASE_DIR, "agent_config.template.yaml")
     
     try:
+        # Obtenir l'interface active pour le template
+        active_interface = ConfigValidator.get_active_network_interface()
+        
         # Créer un template avec des valeurs par défaut et des commentaires
-        template_content = """# Configuration EZRAX IDS/IPS Agent
+        template_content = f"""# Configuration EZRAX IDS/IPS Agent
 # Ce fichier est un template - copiez-le vers agent_config.yaml pour personnaliser
 
 central_server:
@@ -578,7 +633,7 @@ scanners:
     enabled: true
     threshold: 100           # Nombre de paquets SYN pour déclencher l'alerte
     time_window: 5           # Fenêtre de temps (secondes)
-    interfaces: ["eth0"]     # Interfaces à surveiller
+    interfaces: ["{active_interface}"]     # Interface réseau détectée automatiquement
     
   udp_flood:
     enabled: true

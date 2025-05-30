@@ -59,8 +59,6 @@ fi
 
 # Configuration des permissions pour la capture réseau
 echo "[*] Configuration des permissions pour la capture réseau..."
-
-# Donner les capacités nécessaires au binaire Python pour la capture réseau
 SYSTEM_PYTHON=$(readlink -f $(which python3))
 setcap cap_net_raw,cap_net_admin+eip "$SYSTEM_PYTHON"
 
@@ -104,7 +102,7 @@ echo "[*] Création de l'outil de gestion ezraxtl-agent..."
 cat > /usr/local/bin/ezraxtl-agent << 'EOF'
 #!/bin/bash
 
-# Outil de gestion pour l'agent EZRAX IDS/IPS
+# Outil de gestion pour l'agent EZRAX IDS/IPS - Version corrigée
 EZRAX_DIR="/opt/ezrax-agent"
 LOGS_DIR="$EZRAX_DIR/logs"
 PID_FILE="$LOGS_DIR/agent.pid"
@@ -145,7 +143,7 @@ start() {
     sleep 3
     if [ -f "$PID_FILE" ] && kill -0 $(cat "$PID_FILE") 2>/dev/null; then
         # Vérifier si des erreurs de permissions sont présentes dans le log
-        if grep -q "Operation not permitted" "$LOG_FILE"; then
+        if grep -q "Operation not permitted" "$LOG_FILE" 2>/dev/null; then
             echo "AVERTISSEMENT: Erreurs de permissions détectées. Vérifiez la configuration réseau."
             echo "  Utilisez: ezraxtl-agent fix"
         else
@@ -192,7 +190,7 @@ status() {
         PID=$(cat "$PID_FILE")
         if kill -0 $PID 2>/dev/null; then
             echo " - Agent: En cours d'exécution (PID: $PID)"
-            ps -p $PID -o pid,user,etime,cmd | sed 1d
+            ps -p $PID -o pid,user,etime,cmd 2>/dev/null | sed 1d
         else
             echo " - Agent: Arrêté (PID invalide: $PID)"
         fi
@@ -202,7 +200,8 @@ status() {
     
     # Vérifier les capacités réseau
     echo " - Capacités réseau:"
-    CAPS=$(getcap "$EZRAX_DIR/venv/bin/python3" 2>/dev/null)
+    SYSTEM_PYTHON=$(readlink -f "$(which python3)")
+    CAPS=$(getcap "$SYSTEM_PYTHON" 2>/dev/null)
     if [ -n "$CAPS" ]; then
         echo "   - $CAPS"
     else
@@ -212,15 +211,16 @@ status() {
     # Vérifier les scanners actifs (à travers les logs)
     if [ -f "$LOG_FILE" ]; then
         echo " - Scanners actifs:"
-        grep -o "Démarrage du scanner [A-Za-z]*Scanner" "$LOG_FILE" | sort | uniq | sed 's/Démarrage du scanner/  -/'
+        SCANNERS=$(grep -o "Scanner.*démarré" "$LOG_FILE" 2>/dev/null | sort | uniq | wc -l)
+        if [ "$SCANNERS" -gt 0 ]; then
+            grep -o "Scanner.*démarré" "$LOG_FILE" 2>/dev/null | sort | uniq | sed 's/^/   - /'
+        else
+            echo "   - Aucun scanner détecté dans les logs"
+        fi
         
         # Vérifier les erreurs de permissions
         ERROR_COUNT=$(grep -c "Operation not permitted" "$LOG_FILE" 2>/dev/null || echo "0")
-        if [ "$ERROR_COUNT" -gt 0 ]; then
-            echo " - Erreurs de permissions: $ERROR_COUNT (PROBLÈME)"
-        else
-            echo " - Erreurs de permissions: 0"
-        fi
+        echo " - Erreurs de permissions: $ERROR_COUNT"
     fi
     
     # Afficher les IPs bloquées
@@ -229,17 +229,18 @@ status() {
     
     # Afficher les interfaces réseau disponibles
     echo " - Interfaces réseau:"
-    ip link show | grep "state UP" | awk '{print "   - " $2}' | sed 's/:$//'
+    ip link show | grep "state UP" | awk '{print $2}' | sed 's/:$//' | sed 's/^/   - /'
     
     # Afficher la connexion au serveur central
-    CENTRAL_SERVER=$(grep -o "host.*:.*" "$EZRAX_DIR/agent_config.yaml" 2>/dev/null | sed 's/.*: *"\([^"]*\)".*/\1/')
-    if [ -n "$CENTRAL_SERVER" ]; then
-        echo " - Serveur central: $CENTRAL_SERVER"
-        ping -c 1 -w 1 $CENTRAL_SERVER >/dev/null 2>&1
-        if [ $? -eq 0 ]; then
-            echo "   - Connectivité: OK"
-        else
-            echo "   - Connectivité: ÉCHEC"
+    if [ -f "$EZRAX_DIR/agent_config.yaml" ]; then
+        CENTRAL_SERVER=$(grep -A1 "host:" "$EZRAX_DIR/agent_config.yaml" | grep -v "host:" | sed 's/.*"\([^"]*\)".*/\1/' | tr -d ' "')
+        if [ -n "$CENTRAL_SERVER" ]; then
+            echo " - Serveur central: $CENTRAL_SERVER"
+            if ping -c 1 -w 1 "$CENTRAL_SERVER" >/dev/null 2>&1; then
+                echo "   - Connectivité: OK"
+            else
+                echo "   - Connectivité: ÉCHEC"
+            fi
         fi
     fi
 }
@@ -248,10 +249,10 @@ status() {
 logs() {
     if [ "$1" = "error" ]; then
         echo "Affichage des erreurs uniquement:"
-        grep -i "error\|exception\|failed\|operation not permitted" "$LOG_FILE"
+        grep -i "error\|exception\|failed\|operation not permitted" "$LOG_FILE" 2>/dev/null
     elif [ "$1" = "attacks" ]; then
         echo "Affichage des attaques détectées:"
-        grep -i "attaque.*détectée" "$LOG_FILE"
+        grep -i "attaque.*détectée\|attack.*detected" "$LOG_FILE" 2>/dev/null
     else
         echo "Affichage des logs complets:"
         tail -n 50 -f "$LOG_FILE"
@@ -269,16 +270,20 @@ config() {
     fi
     
     # Afficher la configuration du serveur central
-    echo " - Serveur central:"
-    grep -A5 "central_server:" "$EZRAX_DIR/agent_config.yaml" | sed 's/^/   /'
-    
-    # Afficher les scanners activés
-    echo " - Scanners activés:"
-    grep -A1 "enabled:" "$EZRAX_DIR/agent_config.yaml" | grep -v "^--" | sed 's/^/   /'
-    
-    # Afficher la configuration IPS
-    echo " - Configuration IPS:"
-    grep -A5 "ips:" "$EZRAX_DIR/agent_config.yaml" | sed 's/^/   /'
+    if [ -f "$EZRAX_DIR/agent_config.yaml" ]; then
+        echo " - Serveur central:"
+        grep -A5 "central_server:" "$EZRAX_DIR/agent_config.yaml" | sed 's/^/   /'
+        
+        # Afficher les scanners activés
+        echo " - Scanners activés:"
+        grep -A1 "enabled:" "$EZRAX_DIR/agent_config.yaml" | grep -v "^--" | sed 's/^/   /'
+        
+        # Afficher la configuration IPS
+        echo " - Configuration IPS:"
+        grep -A5 "ips:" "$EZRAX_DIR/agent_config.yaml" | sed 's/^/   /'
+    else
+        echo " - Fichier de configuration non trouvé"
+    fi
 }
 
 # Fonction pour déboguer et corriger les erreurs courantes
@@ -310,29 +315,10 @@ fix() {
     ACTIVE_INTERFACE=$(ip route get 8.8.8.8 | grep -oP 'dev \K\S+' | head -1)
     if [ -n "$ACTIVE_INTERFACE" ]; then
         echo "[*] Interface active détectée: $ACTIVE_INTERFACE"
-        # Mettre à jour la configuration
-        sed -i "s/interfaces: \[\".*\"\]/interfaces: [\"$ACTIVE_INTERFACE\"]/" "$EZRAX_DIR/agent_config.yaml"
-        echo "[+] Configuration de l'interface mise à jour."
-    fi
-    
-    # Vérifier le fichier config.py
-    CONFIG_FILE="$EZRAX_DIR/config.py"
-    if [ -f "$CONFIG_FILE" ]; then
-        # Vérifier si l'import logging.handlers est présent
-        if ! grep -q "import logging.handlers" "$CONFIG_FILE"; then
-            echo "[*] Ajout de l'import logging.handlers..."
-            sed -i '/^import logging$/a import logging.handlers' "$CONFIG_FILE"
-        fi
-        
-        # Vérifier si AGENT_ID est ajouté à CONFIG
-        if ! grep -q "CONFIG\[\"AGENT_ID\"\] = AGENT_ID" "$CONFIG_FILE"; then
-            echo "[*] Correction de la configuration pour AGENT_ID..."
-            sed -i '/^CONFIG = load_config()$/a\
-\
-# Ajouter AGENT_ID et AGENT_HOSTNAME à CONFIG\
-CONFIG["AGENT_ID"] = AGENT_ID\
-CONFIG["AGENT_HOSTNAME"] = AGENT_HOSTNAME' "$CONFIG_FILE"
-            echo "[+] Configuration corrigée."
+        # Mettre à jour la configuration si elle existe
+        if [ -f "$EZRAX_DIR/agent_config.yaml" ]; then
+            sed -i "s/interfaces: \[\".*\"\]/interfaces: [\"$ACTIVE_INTERFACE\"]/" "$EZRAX_DIR/agent_config.yaml"
+            echo "[+] Configuration de l'interface mise à jour."
         fi
     fi
     

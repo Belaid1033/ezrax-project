@@ -11,13 +11,20 @@ import json
 import logging
 import threading
 import requests
-import asyncio
 import ssl
 from typing import Dict, List, Any, Optional, Tuple
-from urllib3.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-from requests.adapters import HTTPAdapter as RequestsHTTPAdapter
 from datetime import datetime, timedelta
+
+# Imports corrigés pour éviter les erreurs de modules manquants
+try:
+    from urllib3.util.retry import Retry
+    from requests.adapters import HTTPAdapter
+    URLLIB3_AVAILABLE = True
+except ImportError:
+    # Fallback si urllib3.util.retry n'est pas disponible
+    URLLIB3_AVAILABLE = False
+    Retry = None
+    HTTPAdapter = requests.adapters.HTTPAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -51,27 +58,28 @@ class ExponentialBackoff:
         self.attempt = 0
 
 class SecureHTTPSession:
-    """Session HTTP sécurisée avec retry automatique et pooling"""
+    """Session HTTP sécurisée avec retry automatique et pooling - Version simplifiée"""
     
     def __init__(self, timeout: int = 10, max_retries: int = 3):
         self.session = requests.Session()
         self.timeout = timeout
         
-        # Configuration des retry avec backoff
-        retry_strategy = Retry(
-            total=max_retries,
-            backoff_factor=1,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["HEAD", "GET", "POST", "PUT", "DELETE"]
-        )
-        
-        # Adapter avec retry
-        adapter = RequestsHTTPAdapter(max_retries=retry_strategy)
-        self.session.mount("http://", adapter)
-        self.session.mount("https://", adapter)
+        # Configuration des retry avec backoff (si urllib3 est disponible)
+        if URLLIB3_AVAILABLE and Retry is not None:
+            retry_strategy = Retry(
+                total=max_retries,
+                backoff_factor=1,
+                status_forcelist=[429, 500, 502, 503, 504],
+                allowed_methods=["HEAD", "GET", "POST", "PUT", "DELETE"]
+            )
+            
+            # Adapter avec retry
+            adapter = HTTPAdapter(max_retries=retry_strategy)
+            self.session.mount("http://", adapter)
+            self.session.mount("https://", adapter)
         
         # Configuration SSL sécurisée
-        self.session.verify = True  # Vérifier les certificats SSL
+        self.session.verify = True
         
     def request(self, method: str, url: str, **kwargs) -> requests.Response:
         """Execute une requête avec gestion des erreurs"""
@@ -133,7 +141,7 @@ class ConnectionHealthMonitor:
 
 class CentralClient:
     """
-    Client de communication avec le serveur central - Version optimisée
+    Client de communication avec le serveur central - Version simplifiée et robuste
     """
     
     def __init__(self, config, db_manager, ips_manager):
@@ -161,7 +169,7 @@ class CentralClient:
         self.base_url = self._build_base_url()
         self.check_interval = max(5, self.central_config.get("check_interval", 30))
         
-        # NOUVEAU: Session HTTP sécurisée avec pooling
+        # Session HTTP sécurisée avec pooling
         self.http_session = SecureHTTPSession(
             timeout=self.central_config.get("timeout", 10),
             max_retries=self.central_config.get("max_retries", 3)
@@ -174,15 +182,15 @@ class CentralClient:
         self.last_sync = 0
         self.consecutive_failures = 0
         
-        # NOUVEAU: Gestion robuste des erreurs
+        # Gestion robuste des erreurs
         self.backoff = ExponentialBackoff()
         self.health_monitor = ConnectionHealthMonitor()
         
-        # NOUVEAU: Cache pour éviter les requêtes redondantes
+        # Cache pour éviter les requêtes redondantes
         self.command_cache = {}
         self.whitelist_cache = {"data": [], "last_update": 0}
         
-        # Thread de synchronisation asynchrone
+        # Thread de synchronisation
         self.stop_event = threading.Event()
         self.sync_thread = None
         self.heartbeat_thread = None
@@ -230,7 +238,7 @@ class CentralClient:
             "Content-Type": "application/json",
             "X-API-Key": self._api_key,
             "X-Agent-ID": self.agent_id,
-            "X-Agent-Version": "2.0.0",  # Version de l'agent
+            "X-Agent-Version": "2.0.0",
             "User-Agent": f"EZRAX-Agent/{self.agent_id}",
             "Accept": "application/json",
             "Accept-Encoding": "gzip, deflate"
@@ -408,7 +416,7 @@ class CentralClient:
         
     def sync_with_central(self) -> bool:
         """
-        Synchronise les données avec le serveur central - Version optimisée
+        Synchronise les données avec le serveur central - Version simplifiée
         
         Returns:
             True si la synchronisation a réussi, False sinon
@@ -421,13 +429,9 @@ class CentralClient:
         
         try:
             # Récupérer les données non synchronisées avec pagination
-            max_records = 100  # Limite pour éviter les requêtes trop lourdes
+            max_records = 100
             attack_logs, blocked_ips = self.db_manager.get_unsynced_data(max_records=max_records)
             
-            # Si pas de données à synchroniser, faire quand même un ping
-            if not attack_logs and not blocked_ips:
-                logger.debug("Aucune donnée à synchroniser")
-                
             # Récupérer les statistiques de l'agent (en cache si possible)
             agent_stats = self._get_cached_agent_stats()
             
@@ -593,7 +597,7 @@ class CentralClient:
             
     def _process_commands(self, commands: List[Dict[str, Any]]):
         """
-        Traite les commandes reçues du serveur central - Version sécurisée
+        Traite les commandes reçues du serveur central - Version simplifiée
         
         Args:
             commands: Liste des commandes à exécuter
@@ -617,18 +621,12 @@ class CentralClient:
                 # Traitement sécurisé des commandes
                 success = False
                 
-                if cmd_type == "restart":
-                    success = self._handle_restart_command(cmd_data)
-                elif cmd_type == "update_config":
-                    success = self._handle_update_config_command(cmd_data)
-                elif cmd_type == "block_ip":
+                if cmd_type == "block_ip":
                     success = self._handle_block_ip_command(cmd_data)
                 elif cmd_type == "unblock_ip":
                     success = self._handle_unblock_ip_command(cmd_data)
-                elif cmd_type == "generate_report":
-                    success = self._handle_generate_report_command(cmd_data)
                 elif cmd_type == "get_status":
-                    success = self._handle_get_status_command(cmd_data)
+                    success = True  # Commande passive
                 else:
                     logger.warning(f"Type de commande non reconnu: {cmd_type}")
                     continue
@@ -690,57 +688,6 @@ class CentralClient:
             
         # Exécuter le déblocage
         return self.ips_manager.unblock_ip(ip)
-        
-    def _handle_restart_command(self, cmd_data: Dict[str, Any]) -> bool:
-        """Traite une commande de redémarrage"""
-        try:
-            import subprocess
-            logger.info("Redémarrage de l'agent demandé par le serveur central")
-            
-            # Utiliser systemctl si disponible
-            result = subprocess.run(
-                ["systemctl", "is-active", "ezrax-agent"],
-                capture_output=True,
-                timeout=5
-            )
-            
-            if result.returncode == 0:
-                # Service systemd actif
-                subprocess.Popen(["sudo", "systemctl", "restart", "ezrax-agent"])
-                return True
-            else:
-                logger.warning("Service ezrax-agent non trouvé, redémarrage manuel nécessaire")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Erreur lors du redémarrage: {e}")
-            return False
-            
-    def _handle_update_config_command(self, cmd_data: Dict[str, Any]) -> bool:
-        """Traite une commande de mise à jour de configuration"""
-        # SÉCURITÉ: Ne pas permettre la mise à jour complète de la config depuis le réseau
-        logger.warning("Mise à jour de configuration via réseau désactivée pour des raisons de sécurité")
-        return False
-        
-    def _handle_generate_report_command(self, cmd_data: Dict[str, Any]) -> bool:
-        """Traite une commande de génération de rapport"""
-        try:
-            # Cette fonctionnalité nécessiterait l'injection du ReportGenerator
-            logger.info("Commande de génération de rapport reçue (non implémentée)")
-            return True
-        except Exception as e:
-            logger.error(f"Erreur lors de la génération du rapport: {e}")
-            return False
-            
-    def _handle_get_status_command(self, cmd_data: Dict[str, Any]) -> bool:
-        """Traite une commande de récupération du statut"""
-        try:
-            # Cette commande ne fait rien car le statut est envoyé automatiquement
-            logger.debug("Commande de statut reçue")
-            return True
-        except Exception as e:
-            logger.error(f"Erreur lors de la récupération du statut: {e}")
-            return False
             
     def _acknowledge_command(self, cmd_id: int, success: bool = True):
         """

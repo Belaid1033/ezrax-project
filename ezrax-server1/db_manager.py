@@ -527,7 +527,295 @@ class ServerDatabaseManager:
     def register_agent(self, agent_data: Dict[str, Any]) -> bool:
         """
         Enregistre un agent avec validation complète
+        
+        Args:
+            agent_data: Données de l'agent à enregistrer
+            
+        Returns:
+            True si l'enregistrement a réussi, False sinon
         """
+        start_time = time.time()
+        
+        try:
+            with self.table_locks["agents"]:
+                with self.connection_pool.get_connection() as conn:
+                    cursor = conn.cursor()
+                    
+                    # Vérifier si l'agent existe déjà
+                    cursor.execute('SELECT agent_id, registered_at FROM agents WHERE agent_id = ?', 
+                                 (agent_data["agent_id"],))
+                    existing = cursor.fetchone()
+                    
+                    current_time = time.time()
+                    
+                    if existing:
+                        # Mettre à jour l'agent existant
+                        cursor.execute(
+                            '''UPDATE agents
+                               SET hostname = ?, ip_address = ?, status = 'online', 
+                                   last_seen = ?, os_info = ?, version = ?, features = ?,
+                                   last_sync = ?
+                               WHERE agent_id = ?''',
+                            (
+                                agent_data["hostname"],
+                                agent_data["ip_address"],
+                                current_time,
+                                json.dumps(agent_data.get("os_info", {})),
+                                agent_data.get("version", ""),
+                                json.dumps(agent_data.get("features", {})),
+                                current_time,
+                                agent_data["agent_id"]
+                            )
+                        )
+                        logger.info(f"Agent mis à jour: {agent_data['agent_id']}")
+                    else:
+                        # Créer un nouvel agent
+                        cursor.execute(
+                            '''INSERT INTO agents
+                               (agent_id, hostname, ip_address, status, registered_at, 
+                                last_seen, os_info, version, features, last_sync)
+                               VALUES (?, ?, ?, 'online', ?, ?, ?, ?, ?, ?)''',
+                            (
+                                agent_data["agent_id"],
+                                agent_data["hostname"],
+                                agent_data["ip_address"],
+                                current_time,
+                                current_time,
+                                json.dumps(agent_data.get("os_info", {})),
+                                agent_data.get("version", ""),
+                                json.dumps(agent_data.get("features", {})),
+                                current_time
+                            )
+                        )
+                        self.metrics["agents_registered"] += 1
+                        logger.info(f"Nouvel agent enregistré: {agent_data['agent_id']}")
+                        
+                    conn.commit()
+                    
+                    # Invalider le cache des agents
+                    with self.cache_lock:
+                        expired_keys = [k for k in self.cache.keys() if k.startswith("agents")]
+                        for k in expired_keys:
+                            self.cache.pop(k, None)
+                            self.cache_ttl.pop(k, None)
+                    
+                    self._update_query_metrics(time.time() - start_time)
+                    return True
+                    
+        except Exception as e:
+            logger.error(f"Erreur enregistrement agent: {e}")
+            self.metrics["errors"] += 1
+            return False
+            
+    def update_agent_status(self, agent_id: str, status: str = "online", 
+                          ip_address: Optional[str] = None) -> bool:
+        """Met à jour le statut d'un agent"""
+        start_time = time.time()
+        
+        try:
+            with self.table_locks["agents"]:
+                with self.connection_pool.get_connection() as conn:
+                    cursor = conn.cursor()
+                    
+                    current_time = time.time()
+                    
+                    if ip_address:
+                        cursor.execute(
+                            '''UPDATE agents
+                               SET status = ?, last_seen = ?, ip_address = ?
+                               WHERE agent_id = ?''',
+                            (status, current_time, ip_address, agent_id)
+                        )
+                    else:
+                        cursor.execute(
+                            '''UPDATE agents
+                               SET status = ?, last_seen = ?
+                               WHERE agent_id = ?''',
+                            (status, current_time, agent_id)
+                        )
+                    
+                    success = cursor.rowcount > 0
+                    conn.commit()
+                    
+                    if success:
+                        # Invalider le cache
+                        with self.cache_lock:
+                            self.cache.pop(f"agent:{agent_id}", None)
+                            self.cache_ttl.pop(f"agent:{agent_id}", None)
+                    
+                    self._update_query_metrics(time.time() - start_time)
+                    return success
+                    
+        except Exception as e:
+            logger.error(f"Erreur mise à jour statut agent: {e}")
+            self.metrics["errors"] += 1
+            return False
+            
+    def get_agents(self, include_offline: bool = True) -> List[Dict[str, Any]]:
+        """Récupère la liste des agents avec cache"""
+        cache_key = f"agents:offline_{include_offline}"
+        cached_result = self._get_from_cache(cache_key)
+        if cached_result is not None:
+            return cached_result
+            
+        start_time = time.time()
+        
+        try:
+            with self.connection_pool.get_connection() as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                
+                query = 'SELECT * FROM agents'
+                if not include_offline:
+                    query += " WHERE status = 'online'"
+                query += ' ORDER BY last_seen DESC'
+                
+                cursor.execute(query)
+                
+                agents = []
+                for row in cursor.fetchall():
+                    agent = dict(row)
+                    
+                    # Convertir les champs JSON
+                    for field in ["os_info", "features", "performance_metrics"]:
+                        if agent.get(field):
+                            try:
+                                agent[field] = json.loads(agent[field])
+                            except:
+                                agent[field] = {}
+                                
+                    agents.append(agent)
+                
+                # Mettre en cache pour 30 secondes
+                self._set_cache(cache_key, agents, 30)
+                self._update_query_metrics(time.time() - start_time)
+                return agents
+                
+        except Exception as e:
+            logger.error(f"Erreur récupération agents: {e}")
+            self.metrics["errors"] += 1
+            return []
+            
+    def add_attack_logs(self, logs: List[Dict[str, Any]]) -> int:
+        """Ajoute des logs d'attaques en batch optimisé"""
+        if not logs:
+            return 0
+            
+        start_time = time.time()
+        count = 0
+        
+        try:
+            with self.table_locks["attack_logs"]:
+                with self.connection_pool.get_connection() as conn:
+                    cursor = conn.cursor()
+                    
+                    # Traitement par batch pour performance
+                    batch_size = 100
+                    for i in range(0, len(logs), batch_size):
+                        batch = logs[i:i + batch_size]
+                        
+                        for log in batch:
+                            try:
+                                # Validation des champs requis
+                                if not all(key in log for key in ["agent_id", "timestamp", "attack_type", "source_ip", "scanner"]):
+                                    continue
+                                    
+                                details_json = json.dumps(log.get("details", {}))
+                                severity = log.get("severity", "MEDIUM")
+                                received_at = time.time()
+                                
+                                # Hash pour déduplication
+                                hash_data = f"{log['attack_type']}:{log['source_ip']}:{int(log['timestamp']//60)}"
+                                attack_hash = hashlib.md5(hash_data.encode()).hexdigest()
+                                
+                                cursor.execute(
+                                    '''INSERT OR IGNORE INTO attack_logs 
+                                       (agent_id, timestamp, attack_type, source_ip, scanner, 
+                                        details, severity, hash, received_at)
+                                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                                    (log["agent_id"], log["timestamp"], log["attack_type"],
+                                     log["source_ip"], log["scanner"], details_json,
+                                     severity, attack_hash, received_at)
+                                )
+                                
+                                if cursor.rowcount > 0:
+                                    count += 1
+                                    
+                            except Exception as e:
+                                logger.warning(f"Log d'attaque ignoré: {e}")
+                                
+                        conn.commit()
+                        
+            self.metrics["attacks_processed"] += count
+            self._update_query_metrics(time.time() - start_time)
+            
+            if count > 0:
+                logger.info(f"{count} logs d'attaques ajoutés au serveur")
+                
+            return count
+            
+        except Exception as e:
+            logger.error(f"Erreur ajout logs d'attaques: {e}")
+            self.metrics["errors"] += 1
+            return 0
+            
+    def add_blocked_ips(self, blocked_ips: List[Dict[str, Any]]) -> int:
+        """Ajoute des IPs bloquées en batch optimisé"""
+        if not blocked_ips:
+            return 0
+            
+        start_time = time.time()
+        count = 0
+        
+        try:
+            with self.table_locks["blocked_ips"]:
+                with self.connection_pool.get_connection() as conn:
+                    cursor = conn.cursor()
+                    
+                    for block in blocked_ips:
+                        try:
+                            # Validation des champs requis
+                            if not all(key in block for key in ["agent_id", "ip", "timestamp", "reason", "duration"]):
+                                continue
+                                
+                            cursor.execute(
+                                '''INSERT OR IGNORE INTO blocked_ips 
+                                   (agent_id, ip, timestamp, end_time, reason, duration, received_at)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                                (block["agent_id"], block["ip"], block["timestamp"],
+                                 block.get("end_time"), block["reason"], block["duration"],
+                                 time.time())
+                            )
+                            
+                            if cursor.rowcount > 0:
+                                count += 1
+                                
+                        except Exception as e:
+                            logger.warning(f"IP bloquée ignorée: {e}")
+                            
+                    conn.commit()
+                    
+            self._update_query_metrics(time.time() - start_time)
+            
+            if count > 0:
+                logger.info(f"{count} IPs bloquées ajoutées au serveur")
+                
+            return count
+            
+        except Exception as e:
+            logger.error(f"Erreur ajout IPs bloquées: {e}")
+            self.metrics["errors"] += 1
+            return 0
+            
+    def get_attack_logs(self, limit: int = 100, offset: int = 0, since: Optional[float] = None,
+                       attack_type: Optional[str] = None, agent_id: Optional[str] = None,
+                       source_ip: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Récupère les logs d'attaques avec filtres optimisés"""
+        cache_key = f"attack_logs:{limit}:{offset}:{since}:{attack_type}:{agent_id}:{source_ip}"
+        cached_result = self._get_from_cache(cache_key)
+        if cached_result is not None:
+            return cached_result
+            
         start_time = time.time()
         
         try:
@@ -1280,285 +1568,3 @@ class ServerDatabaseManager:
             
         except Exception as e:
             logger.error(f"Erreur fermeture serveur: {e}")
-        
-        try:
-            with self.table_locks["agents"]:
-                with self.connection_pool.get_connection() as conn:
-                    cursor = conn.cursor()
-                    
-                    # Vérifier si l'agent existe déjà
-                    cursor.execute('SELECT agent_id, registered_at FROM agents WHERE agent_id = ?', 
-                                 (agent_data["agent_id"],))
-                    existing = cursor.fetchone()
-                    
-                    current_time = time.time()
-                    
-                    if existing:
-                        # Mettre à jour l'agent existant
-                        cursor.execute(
-                            '''UPDATE agents
-                               SET hostname = ?, ip_address = ?, status = 'online', 
-                                   last_seen = ?, os_info = ?, version = ?, features = ?,
-                                   last_sync = ?
-                               WHERE agent_id = ?''',
-                            (
-                                agent_data["hostname"],
-                                agent_data["ip_address"],
-                                current_time,
-                                json.dumps(agent_data.get("os_info", {})),
-                                agent_data.get("version", ""),
-                                json.dumps(agent_data.get("features", {})),
-                                current_time,
-                                agent_data["agent_id"]
-                            )
-                        )
-                        logger.info(f"Agent mis à jour: {agent_data['agent_id']}")
-                    else:
-                        # Créer un nouvel agent
-                        cursor.execute(
-                            '''INSERT INTO agents
-                               (agent_id, hostname, ip_address, status, registered_at, 
-                                last_seen, os_info, version, features, last_sync)
-                               VALUES (?, ?, ?, 'online', ?, ?, ?, ?, ?, ?)''',
-                            (
-                                agent_data["agent_id"],
-                                agent_data["hostname"],
-                                agent_data["ip_address"],
-                                current_time,
-                                current_time,
-                                json.dumps(agent_data.get("os_info", {})),
-                                agent_data.get("version", ""),
-                                json.dumps(agent_data.get("features", {})),
-                                current_time
-                            )
-                        )
-                        self.metrics["agents_registered"] += 1
-                        logger.info(f"Nouvel agent enregistré: {agent_data['agent_id']}")
-                        
-                    conn.commit()
-                    
-                    # Invalider le cache des agents
-                    with self.cache_lock:
-                        expired_keys = [k for k in self.cache.keys() if k.startswith("agents")]
-                        for k in expired_keys:
-                            self.cache.pop(k, None)
-                            self.cache_ttl.pop(k, None)
-                    
-                    self._update_query_metrics(time.time() - start_time)
-                    return True
-                    
-        except Exception as e:
-            logger.error(f"Erreur enregistrement agent: {e}")
-            self.metrics["errors"] += 1
-            return False
-            
-    def update_agent_status(self, agent_id: str, status: str = "online", 
-                          ip_address: Optional[str] = None) -> bool:
-        """Met à jour le statut d'un agent"""
-        start_time = time.time()
-        
-        try:
-            with self.table_locks["agents"]:
-                with self.connection_pool.get_connection() as conn:
-                    cursor = conn.cursor()
-                    
-                    current_time = time.time()
-                    
-                    if ip_address:
-                        cursor.execute(
-                            '''UPDATE agents
-                               SET status = ?, last_seen = ?, ip_address = ?
-                               WHERE agent_id = ?''',
-                            (status, current_time, ip_address, agent_id)
-                        )
-                    else:
-                        cursor.execute(
-                            '''UPDATE agents
-                               SET status = ?, last_seen = ?
-                               WHERE agent_id = ?''',
-                            (status, current_time, agent_id)
-                        )
-                    
-                    success = cursor.rowcount > 0
-                    conn.commit()
-                    
-                    if success:
-                        # Invalider le cache
-                        with self.cache_lock:
-                            self.cache.pop(f"agent:{agent_id}", None)
-                            self.cache_ttl.pop(f"agent:{agent_id}", None)
-                    
-                    self._update_query_metrics(time.time() - start_time)
-                    return success
-                    
-        except Exception as e:
-            logger.error(f"Erreur mise à jour statut agent: {e}")
-            self.metrics["errors"] += 1
-            return False
-            
-    def get_agents(self, include_offline: bool = True) -> List[Dict[str, Any]]:
-        """Récupère la liste des agents avec cache"""
-        cache_key = f"agents:offline_{include_offline}"
-        cached_result = self._get_from_cache(cache_key)
-        if cached_result is not None:
-            return cached_result
-            
-        start_time = time.time()
-        
-        try:
-            with self.connection_pool.get_connection() as conn:
-                conn.row_factory = sqlite3.Row
-                cursor = conn.cursor()
-                
-                query = 'SELECT * FROM agents'
-                if not include_offline:
-                    query += " WHERE status = 'online'"
-                query += ' ORDER BY last_seen DESC'
-                
-                cursor.execute(query)
-                
-                agents = []
-                for row in cursor.fetchall():
-                    agent = dict(row)
-                    
-                    # Convertir les champs JSON
-                    for field in ["os_info", "features", "performance_metrics"]:
-                        if agent.get(field):
-                            try:
-                                agent[field] = json.loads(agent[field])
-                            except:
-                                agent[field] = {}
-                                
-                    agents.append(agent)
-                
-                # Mettre en cache pour 30 secondes
-                self._set_cache(cache_key, agents, 30)
-                self._update_query_metrics(time.time() - start_time)
-                return agents
-                
-        except Exception as e:
-            logger.error(f"Erreur récupération agents: {e}")
-            self.metrics["errors"] += 1
-            return []
-            
-    def add_attack_logs(self, logs: List[Dict[str, Any]]) -> int:
-        """Ajoute des logs d'attaques en batch optimisé"""
-        if not logs:
-            return 0
-            
-        start_time = time.time()
-        count = 0
-        
-        try:
-            with self.table_locks["attack_logs"]:
-                with self.connection_pool.get_connection() as conn:
-                    cursor = conn.cursor()
-                    
-                    # Traitement par batch pour performance
-                    batch_size = 100
-                    for i in range(0, len(logs), batch_size):
-                        batch = logs[i:i + batch_size]
-                        
-                        for log in batch:
-                            try:
-                                # Validation des champs requis
-                                if not all(key in log for key in ["agent_id", "timestamp", "attack_type", "source_ip", "scanner"]):
-                                    continue
-                                    
-                                details_json = json.dumps(log.get("details", {}))
-                                severity = log.get("severity", "MEDIUM")
-                                received_at = time.time()
-                                
-                                # Hash pour déduplication
-                                hash_data = f"{log['attack_type']}:{log['source_ip']}:{int(log['timestamp']//60)}"
-                                attack_hash = hashlib.md5(hash_data.encode()).hexdigest()
-                                
-                                cursor.execute(
-                                    '''INSERT OR IGNORE INTO attack_logs 
-                                       (agent_id, timestamp, attack_type, source_ip, scanner, 
-                                        details, severity, hash, received_at)
-                                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                                    (log["agent_id"], log["timestamp"], log["attack_type"],
-                                     log["source_ip"], log["scanner"], details_json,
-                                     severity, attack_hash, received_at)
-                                )
-                                
-                                if cursor.rowcount > 0:
-                                    count += 1
-                                    
-                            except Exception as e:
-                                logger.warning(f"Log d'attaque ignoré: {e}")
-                                
-                        conn.commit()
-                        
-            self.metrics["attacks_processed"] += count
-            self._update_query_metrics(time.time() - start_time)
-            
-            if count > 0:
-                logger.info(f"{count} logs d'attaques ajoutés au serveur")
-                
-            return count
-            
-        except Exception as e:
-            logger.error(f"Erreur ajout logs d'attaques: {e}")
-            self.metrics["errors"] += 1
-            return 0
-            
-    def add_blocked_ips(self, blocked_ips: List[Dict[str, Any]]) -> int:
-        """Ajoute des IPs bloquées en batch optimisé"""
-        if not blocked_ips:
-            return 0
-            
-        start_time = time.time()
-        count = 0
-        
-        try:
-            with self.table_locks["blocked_ips"]:
-                with self.connection_pool.get_connection() as conn:
-                    cursor = conn.cursor()
-                    
-                    for block in blocked_ips:
-                        try:
-                            # Validation des champs requis
-                            if not all(key in block for key in ["agent_id", "ip", "timestamp", "reason", "duration"]):
-                                continue
-                                
-                            cursor.execute(
-                                '''INSERT OR IGNORE INTO blocked_ips 
-                                   (agent_id, ip, timestamp, end_time, reason, duration, received_at)
-                                   VALUES (?, ?, ?, ?, ?, ?, ?)''',
-                                (block["agent_id"], block["ip"], block["timestamp"],
-                                 block.get("end_time"), block["reason"], block["duration"],
-                                 time.time())
-                            )
-                            
-                            if cursor.rowcount > 0:
-                                count += 1
-                                
-                        except Exception as e:
-                            logger.warning(f"IP bloquée ignorée: {e}")
-                            
-                    conn.commit()
-                    
-            self._update_query_metrics(time.time() - start_time)
-            
-            if count > 0:
-                logger.info(f"{count} IPs bloquées ajoutées au serveur")
-                
-            return count
-            
-        except Exception as e:
-            logger.error(f"Erreur ajout IPs bloquées: {e}")
-            self.metrics["errors"] += 1
-            return 0
-            
-    def get_attack_logs(self, limit: int = 100, offset: int = 0, since: Optional[float] = None,
-                       attack_type: Optional[str] = None, agent_id: Optional[str] = None,
-                       source_ip: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Récupère les logs d'attaques avec filtres optimisés"""
-        cache_key = f"attack_logs:{limit}:{offset}:{since}:{attack_type}:{agent_id}:{source_ip}"
-        cached_result = self._get_from_cache(cache_key)
-        if cached_result is not None:
-            return cached_result
-            
-        start_time = time.time()

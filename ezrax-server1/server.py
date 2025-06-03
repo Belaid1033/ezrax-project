@@ -21,17 +21,17 @@ from typing import Dict, List, Any, Optional
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 
-# Imports des modules améliorés
+# Imports des modules (corrigés)
 try:
-    from server_config_improved import (
+    from config import (
         load_server_config, 
         setup_server_logging, 
         save_server_config_template,
         create_example_agent_config,
         get_server_info
     )
-    from db_manager_improved import ServerDatabaseManager
-    from server_api_improved import EzraxServerAPI
+    from db_manager import ServerDatabaseManager
+    from server_api import EzraxServerAPI
 except ImportError as e:
     print(f"Erreur d'importation: {e}")
     print("Assurez-vous que tous les fichiers du serveur sont présents")

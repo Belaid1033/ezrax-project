@@ -55,10 +55,6 @@ log() {
 banner() {
     echo -e "${CYAN}"
     cat << "EOF"
- _____ _______ ______  _____ _     _  _____                           
-|_____|______|______|  |   | |_____|/ |     
-|_____|______|______| _|   |_|     |\_|_____|
-        
 EZRAX Central Server v2.0 - Installation
 Système centralisé de gestion IDS/IPS
 EOF
@@ -147,15 +143,32 @@ install_system_dependencies() {
         "libssl-dev"
     )
     
+    # Dépendances pour Pillow (importantes pour éviter les erreurs de build)
+    local pillow_deps=(
+        "libjpeg-dev"
+        "zlib1g-dev"
+        "libpng-dev"
+        "libtiff-dev"
+        "libfreetype6-dev"
+        "libwebp-dev"
+    )
+    
     # Dépendances optionnelles pour interface graphique
     local gui_packages=(
         "python3-tk"
+        "python3-pil"
         "python3-pil.imagetk"
     )
     
     # Installation des paquets de base
     log "INFO" "Installation des dépendances de base..."
     apt install -y "${base_packages[@]}"
+    
+    # Installation des dépendances Pillow
+    log "INFO" "Installation des dépendances pour l'image processing..."
+    apt install -y "${pillow_deps[@]}" || {
+        log "WARNING" "Certaines dépendances Pillow n'ont pas pu être installées"
+    }
     
     # Installation des dépendances GUI (optionnel)
     log "INFO" "Installation des dépendances GUI (optionnel)..."
@@ -209,9 +222,14 @@ setup_application_directory() {
     rm -f "$EZRAX_DIR"/{setup_server.sh,*.md,*.log}
     
     # Permissions
+    
     chown -R "$EZRAX_USER:$EZRAX_USER" "$EZRAX_DIR"
     chmod -R 755 "$EZRAX_DIR"
     chmod 600 "$EZRAX_DIR"/*.py 2>/dev/null || true
+    chmod -R 755 /opt/ezrax-server/logs
+    chmod 1777 /tmp
+    chown -R ezrax:ezrax /opt/ezrax-server
+    
     
     log "SUCCESS" "Répertoire de l'application configuré"
 }
@@ -425,6 +443,32 @@ start_server() {
     fi
 }
 
+start_gui() {
+    if is_running; then
+        log_message "WARNING" "Le serveur EZRAX est déjà en cours d'exécution"
+        log_message "INFO" "Arrêtez-le d'abord avec: ezraxtl stop"
+        return 1
+    fi
+    
+    log_message "INFO" "Démarrage du serveur EZRAX avec interface graphique..."
+    ensure_directories
+    
+    # Vérifier les dépendances GUI
+    cd "$EZRAX_DIR"
+    if ! sudo -u "$EZRAX_USER" "$EZRAX_DIR/venv/bin/python" -c "import tkinter" 2>/dev/null; then
+        log_message "ERROR" "Module tkinter non disponible. Interface graphique impossible."
+        log_message "INFO" "Utilisez 'ezraxtl start' pour démarrer en mode console."
+        return 1
+    fi
+    
+    # Lancer en mode graphique
+    sudo -u "$EZRAX_USER" DISPLAY=${DISPLAY:-:0} "$EZRAX_DIR/venv/bin/python" "$EZRAX_DIR/server.py" &
+    
+    log_message "SUCCESS" "Interface graphique EZRAX lancée"
+    log_message "INFO" "L'interface devrait apparaître dans quelques secondes"
+    log_message "INFO" "Si rien n'apparaît, vérifiez que X11 est configuré correctement"
+}
+
 stop_server() {
     if ! is_running; then
         log_message "INFO" "Le serveur EZRAX n'est pas en cours d'exécution"
@@ -631,6 +675,7 @@ show_help() {
     echo
     echo "Commandes disponibles:"
     echo "  start         Démarrer le serveur EZRAX"
+    echo "  gui           Démarrer le serveur EZRAX avec interface graphique"
     echo "  stop          Arrêter le serveur EZRAX"
     echo "  restart       Redémarrer le serveur EZRAX"
     echo "  status        Afficher le statut du serveur"
@@ -652,6 +697,10 @@ main() {
         "start")
             check_permissions
             start_server
+            ;;
+        "gui")
+            check_permissions
+            start_gui
             ;;
         "stop")
             check_permissions
@@ -814,6 +863,7 @@ show_installation_summary() {
     echo
     echo -e "${YELLOW}Commandes de gestion:${NC}"
     echo "  ezraxtl start      - Démarrer le serveur"
+    echo "  ezraxtl gui        - Démarrer avec interface graphique"
     echo "  ezraxtl stop       - Arrêter le serveur"
     echo "  ezraxtl status     - Vérifier le statut"
     echo "  ezraxtl logs       - Afficher les logs"

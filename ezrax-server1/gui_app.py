@@ -2195,7 +2195,7 @@ Fonctionnalités:
 
 Développé avec Python, Flask, Tkinter et SQLite
 
-© 2024 EZRAX Project"""
+© 2025 EZRAX Project by Belaid Ahouari"""
 
         messagebox.showinfo("À propos d'EZRAX Central Server", about_text)
         

@@ -1602,7 +1602,7 @@ class ServerDatabaseManager:
         
         try:
             # Arrêter l'executor
-            self.executor.shutdown(wait=True, timeout=10)
+            self.executor.shutdown(wait=True)
             
             # Fermer le pool de connexions
             self.connection_pool.close_all()

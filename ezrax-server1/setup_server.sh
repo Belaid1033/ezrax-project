@@ -195,7 +195,7 @@ create_ezrax_user() {
     
     # Ajouter aux groupes nécessaires
     usermod -a -G adm,systemd-journal "$EZRAX_USER" 2>/dev/null || true
-    
+    sudo usermod -a -G ezrax $(whoami)
     # Créer les répertoires utilisateur
     mkdir -p "/home/$EZRAX_USER/.ezrax"
     chown -R "$EZRAX_USER:$EZRAX_USER" "/home/$EZRAX_USER"
@@ -226,10 +226,6 @@ setup_application_directory() {
     chown -R "$EZRAX_USER:$EZRAX_USER" "$EZRAX_DIR"
     chmod -R 755 "$EZRAX_DIR"
     chmod 600 "$EZRAX_DIR"/*.py 2>/dev/null || true
-    chmod -R 755 /opt/ezrax-server/logs
-    chmod 1777 /tmp
-    chown -R ezrax:ezrax /opt/ezrax-server
-    
     
     log "SUCCESS" "Répertoire de l'application configuré"
 }
@@ -417,14 +413,17 @@ start_server() {
     
     # Démarrer le serveur
     cd "$EZRAX_DIR"
-    sudo -u "$EZRAX_USER" nohup "$EZRAX_DIR/venv/bin/python" "$EZRAX_DIR/server.py" \
-        --config "$CONFIG_FILE" --daemon > "$LOG_FILE" 2>&1 &
+    sudo -u "$EZRAX_USER" sh -c "nohup '$EZRAX_DIR/venv/bin/python' '$EZRAX_DIR/server.py' \
+        --config '$CONFIG_FILE' --daemon > '$LOG_FILE' 2>&1 & echo \$! > '$PID_FILE'"
     
-    local pid=$!
-    echo $pid > "$PID_FILE"
+    sleep 1 
+    if [[ ! -f "$PID_FILE" ]]; then
+        log_message "WARNING" "Fichier PID non créé après 1s. Le démarrage a peut-être échoué."
+        # Vous pourriez ajouter une vérification is_running ici ou un log plus détaillé.
+    fi
     
     # Vérifier que le démarrage a réussi
-    sleep 3
+    sleep 2
     if is_running; then
         log_message "SUCCESS" "Serveur EZRAX démarré (PID: $(cat $PID_FILE))"
         
@@ -439,9 +438,15 @@ start_server() {
     else
         log_message "ERROR" "Échec du démarrage du serveur. Vérifiez les logs:"
         log_message "INFO" "ezraxtl logs"
+        if [[ -f "$LOG_FILE" ]]; then
+            log_message "INFO" "Dernières lignes du log:"
+            tail -n 10 "$LOG_FILE"
+        fi
         return 1
+
     fi
 }
+
 
 start_gui() {
     if is_running; then
@@ -453,20 +458,34 @@ start_gui() {
     log_message "INFO" "Démarrage du serveur EZRAX avec interface graphique..."
     ensure_directories
     
+    # Vérification plus robuste de l'environnement graphique
+    if [ -z "$DISPLAY" ]; then
+        log_message "WARNING" "Variable DISPLAY non définie. Définition à :0"
+        export DISPLAY=":0"
+    fi
+    
+    # Test de l'accès à X11
+    if ! xset q &>/dev/null; then
+        log_message "ERROR" "Serveur X11 non disponible. Interface graphique impossible."
+        log_message "INFO" "Utilisez 'ezraxtl start' pour démarrer en mode console."
+        log_message "INFO" "Pour utiliser l'interface graphique, exécutez dans une session avec un serveur X"
+        return 1
+    fi
+    
     # Vérifier les dépendances GUI
     cd "$EZRAX_DIR"
     if ! sudo -u "$EZRAX_USER" "$EZRAX_DIR/venv/bin/python" -c "import tkinter" 2>/dev/null; then
         log_message "ERROR" "Module tkinter non disponible. Interface graphique impossible."
+        log_message "INFO" "Installez tkinter avec: apt install python3-tk"
         log_message "INFO" "Utilisez 'ezraxtl start' pour démarrer en mode console."
         return 1
     fi
     
-    # Lancer en mode graphique
-    sudo -u "$EZRAX_USER" DISPLAY=${DISPLAY:-:0} "$EZRAX_DIR/venv/bin/python" "$EZRAX_DIR/server.py" &
+    # Lancer en mode graphique avec permissions correctes
+    sudo "$EZRAX_DIR/venv/bin/python" "$EZRAX_DIR/gui_app.py"
     
     log_message "SUCCESS" "Interface graphique EZRAX lancée"
     log_message "INFO" "L'interface devrait apparaître dans quelques secondes"
-    log_message "INFO" "Si rien n'apparaît, vérifiez que X11 est configuré correctement"
 }
 
 stop_server() {
@@ -481,22 +500,34 @@ stop_server() {
     # Tentative d'arrêt gracieux
     kill "$pid" 2>/dev/null
     
-    # Attendre l'arrêt
+    # Attendre l'arrêt avec un timeout plus long
     local count=0
-    while is_running && [[ $count -lt 10 ]]; do
+    while is_running && [[ $count -lt 20 ]]; do
         sleep 1
         ((count++))
     done
     
-    # Forcer l'arrêt si nécessaire
-    if is_running; then
+    # Vérifier si le processus existe toujours, quelle que soit la valeur dans le fichier PID
+    if kill -0 "$pid" 2>/dev/null; then
         log_message "WARNING" "Arrêt forcé du serveur..."
+        # Utiliser SIGKILL
         kill -9 "$pid" 2>/dev/null
         sleep 2
+        
+        # Vérifier à nouveau
+        if kill -0 "$pid" 2>/dev/null; then
+            log_message "WARNING" "Le processus résiste! Tentative avec killall..."
+            # Dernière tentative avec killall
+            killall -9 python3 2>/dev/null || true
+        fi
     fi
     
+    # Supprimer le fichier PID même si le kill échoue
     rm -f "$PID_FILE"
     log_message "SUCCESS" "Serveur EZRAX arrêté"
+    
+    # Nettoyer les processus orphelins liés à EZRAX
+    pkill -f "ezrax.*python" 2>/dev/null || true
 }
 
 show_status() {

@@ -2,805 +2,778 @@
 # -*- coding: utf-8 -*-
 
 """
-Point d'entrée principal du serveur central EZRAX v2.0 - Version optimisée
+API REST sécurisée pour le serveur central EZRAX v2.0
 """
 
 import os
 import sys
 import time
-import signal
-import logging
-import argparse
-import threading
 import json
+import logging
+import threading
+import traceback
 import secrets
-from pathlib import Path
-from typing import Dict, List, Any, Optional
+import hashlib
+from datetime import datetime, timedelta
+from typing import Dict, List, Any, Optional, Tuple
+from functools import wraps
+from collections import defaultdict, deque
 
-# Configuration du logging précoce
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("ezrax_server.log")
-    ]
-)
+try:
+    from flask import Flask, request, jsonify, abort, make_response, g
+    from werkzeug.serving import make_server, WSGIRequestHandler
+    from werkzeug.exceptions import BadRequest, Unauthorized, Forbidden, NotFound, TooManyRequests
+    import jwt
+except ImportError as e:
+    print(f"Dépendances manquantes: {e}")
+    print("Installez avec: pip install flask pyjwt")
+    sys.exit(1)
+
 logger = logging.getLogger(__name__)
 
-# Importation des modules
-from db_manager import ServerDatabaseManager
-from server_api import EzraxServerAPI
-from gui_app import EzraxServerGUI
-
-class EzraxServerConfig:
-    """Gestionnaire de configuration du serveur avec validation"""
+class RateLimiter:
+    """Rate limiter avancé avec fenêtre glissante"""
     
-    def __init__(self, config_file="server_config.json"):
-        self.config_file = config_file
-        self.config = self._load_config()
+    def __init__(self, max_requests: int, window_seconds: int):
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self.requests = defaultdict(lambda: deque())
+        self.lock = threading.Lock()
         
-    def _load_config(self) -> Dict[str, Any]:
-        """Charge la configuration depuis le fichier"""
-        default_config = {
-            "server": {
-                "host": "0.0.0.0",
-                "port": 5000,
-                "debug": False,
-                "max_content_length": 16777216,  # 16MB
-                "request_timeout": 30
-            },
-            "database": {
-                "path": "ezrax_server.db",
-                "pool_size": 15,
-                "backup_enabled": True,
-                "backup_interval": 86400,
-                "retention_days": 30
-            },
-            "security": {
-                "api_key": None,  # Sera généré si absent
-                "jwt_secret": None,  # Sera généré si absent
-                "admin_api_enabled": True,
-                "rate_limiting": {
-                    "agents": {"max_requests": 1000, "window_seconds": 60},
-                    "admin": {"max_requests": 200, "window_seconds": 60},
-                    "public": {"max_requests": 50, "window_seconds": 60}
-                }
-            },
-            "logging": {
-                "level": "INFO",
-                "file": "ezrax_server.log",
-                "max_size": 10485760,  # 10MB
-                "backup_count": 5,
-                "console_enabled": True
-            },
-            "monitoring": {
-                "metrics_enabled": True,
-                "performance_alerts": True,
-                "health_check_interval": 60
+    def is_allowed(self, client_id: str) -> bool:
+        """Vérifie si la requête est autorisée"""
+        current_time = time.time()
+        cutoff_time = current_time - self.window_seconds
+        
+        with self.lock:
+            # Nettoyer les anciennes requêtes
+            client_requests = self.requests[client_id]
+            while client_requests and client_requests[0] < cutoff_time:
+                client_requests.popleft()
+                
+            # Vérifier la limite
+            if len(client_requests) >= self.max_requests:
+                return False
+                
+            # Ajouter la nouvelle requête
+            client_requests.append(current_time)
+            return True
+            
+    def get_stats(self) -> Dict[str, Any]:
+        """Retourne les statistiques du rate limiter"""
+        with self.lock:
+            active_clients = len([client for client, reqs in self.requests.items() if reqs])
+            total_requests = sum(len(reqs) for reqs in self.requests.values())
+            
+            return {
+                "active_clients": active_clients,
+                "total_requests_tracked": total_requests,
+                "max_requests_per_window": self.max_requests,
+                "window_seconds": self.window_seconds
             }
-        }
-        
-        if os.path.exists(self.config_file):
-            try:
-                with open(self.config_file, 'r') as f:
-                    file_config = json.load(f)
-                    
-                # Fusion des configs
-                self._deep_update(default_config, file_config)
-                logger.info(f"Configuration chargée depuis {self.config_file}")
-                
-            except Exception as e:
-                logger.error(f"Erreur lors du chargement de la config: {e}")
-                logger.info("Utilisation de la configuration par défaut")
-                
-        else:
-            logger.info(f"Fichier de config non trouvé, création de {self.config_file}")
-            self._save_config(default_config)
-            
-        # Générer les secrets manquants
-        self._ensure_secrets(default_config)
-        
-        return default_config
-        
-    def _deep_update(self, base_dict: Dict, update_dict: Dict):
-        """Met à jour récursivement un dictionnaire"""
-        for key, value in update_dict.items():
-            if key in base_dict and isinstance(base_dict[key], dict) and isinstance(value, dict):
-                self._deep_update(base_dict[key], value)
-            else:
-                base_dict[key] = value
-                
-    def _ensure_secrets(self, config: Dict[str, Any]):
-        """Génère les secrets manquants"""
-        secrets_updated = False
-        
-        if not config["security"]["api_key"]:
-            config["security"]["api_key"] = secrets.token_urlsafe(32)
-            secrets_updated = True
-            logger.info("Nouvelle clé API générée")
-            
-        if not config["security"]["jwt_secret"]:
-            config["security"]["jwt_secret"] = secrets.token_urlsafe(32)
-            secrets_updated = True
-            logger.info("Nouveau secret JWT généré")
-            
-        if secrets_updated:
-            self._save_config(config)
-            
-    def _save_config(self, config: Dict[str, Any]):
-        """Sauvegarde la configuration"""
-        try:
-            # Masquer les secrets pour l'affichage
-            config_copy = json.loads(json.dumps(config))
-            config_copy["security"]["api_key"] = "***GÉNÉRÉ***"
-            config_copy["security"]["jwt_secret"] = "***GÉNÉRÉ***"
-            
-            with open(self.config_file, 'w') as f:
-                json.dump(config, f, indent=2)
-                
-            logger.info(f"Configuration sauvegardée dans {self.config_file}")
-            
-        except Exception as e:
-            logger.error(f"Erreur lors de la sauvegarde de la config: {e}")
-            
-    def get(self, key_path: str, default=None):
-        """Récupère une valeur de configuration avec chemin pointé"""
-        keys = key_path.split('.')
-        value = self.config
-        
-        for key in keys:
-            if isinstance(value, dict) and key in value:
-                value = value[key]
-            else:
-                return default
-                
-        return value
 
-class PerformanceMonitor:
-    """Moniteur de performance du serveur"""
+class APIMetrics:
+    """Collecteur de métriques API"""
     
-    def __init__(self, server_manager, check_interval=60):
-        self.server_manager = server_manager
-        self.check_interval = check_interval
-        self.running = False
-        self.thread = None
-        self.alerts = []
+    def __init__(self):
+        self.start_time = time.time()
+        self.requests_total = 0
+        self.requests_success = 0
+        self.requests_failed = 0
+        self.requests_rate_limited = 0
+        self.response_times = deque(maxlen=1000)
+        self.active_agents = set()
+        self.admin_logins = 0
+        self.lock = threading.Lock()
         
-    def start(self):
-        """Démarre le monitoring"""
-        if self.running:
-            return
-            
-        self.running = True
-        self.thread = threading.Thread(target=self._monitor_loop, daemon=True)
-        self.thread.start()
-        logger.info("Monitoring de performance démarré")
-        
-    def stop(self):
-        """Arrête le monitoring"""
-        self.running = False
-        if self.thread:
-            self.thread.join(timeout=5)
-            
-    def _monitor_loop(self):
-        """Boucle de monitoring"""
-        while self.running:
-            try:
-                self._check_performance()
-                time.sleep(self.check_interval)
-            except Exception as e:
-                logger.error(f"Erreur dans le monitoring: {e}")
-                time.sleep(30)
+    def record_request(self, success: bool, response_time: float, rate_limited: bool = False):
+        """Enregistre une requête"""
+        with self.lock:
+            self.requests_total += 1
+            if rate_limited:
+                self.requests_rate_limited += 1
+            elif success:
+                self.requests_success += 1
+            else:
+                self.requests_failed += 1
                 
-    def _check_performance(self):
-        """Vérifie les performances et génère des alertes"""
-        try:
-            # Métriques de la base de données
-            if hasattr(self.server_manager, 'db_manager'):
-                db_metrics = self.server_manager.db_manager.get_performance_metrics()
-                
-                # Alertes DB
-                if db_metrics['avg_query_time'] > 0.5:  # 500ms
-                    self._add_alert("WARNING", f"Temps de requête DB élevé: {db_metrics['avg_query_time']*1000:.0f}ms")
-                    
-                if db_metrics['connection_pool']['active_connections'] >= db_metrics['connection_pool']['pool_size'] * 0.9:
-                    self._add_alert("WARNING", "Pool de connexions DB près de la saturation")
-                    
-                cache_hit_rate = db_metrics['query_cache']['hit_rate']
-                if cache_hit_rate < 0.7:  # Moins de 70%
-                    self._add_alert("INFO", f"Taux de cache DB faible: {cache_hit_rate:.1%}")
-                    
-            # Métriques de l'API
-            if hasattr(self.server_manager, 'api_server'):
-                api_metrics = self.server_manager.api_server.get_api_metrics()
-                
-                # Alertes API
-                api_stats = api_metrics['api_metrics']
-                if api_stats['avg_response_time'] > 1.0:  # 1 seconde
-                    self._add_alert("WARNING", f"Temps de réponse API élevé: {api_stats['avg_response_time']*1000:.0f}ms")
-                    
-                error_rate = api_stats['requests_failed'] / max(api_stats['requests_total'], 1)
-                if error_rate > 0.05:  # Plus de 5% d'erreurs
-                    self._add_alert("ERROR", f"Taux d'erreur API élevé: {error_rate:.1%}")
-                    
-        except Exception as e:
-            logger.error(f"Erreur lors de la vérification des performances: {e}")
+            self.response_times.append(response_time)
             
-    def _add_alert(self, level: str, message: str):
-        """Ajoute une alerte"""
-        alert = {
-            "timestamp": time.time(),
-            "level": level,
-            "message": message
-        }
-        
-        self.alerts.append(alert)
-        
-        # Limiter le nombre d'alertes
-        if len(self.alerts) > 100:
-            self.alerts = self.alerts[-50:]
+    def record_agent_activity(self, agent_id: str):
+        """Enregistre l'activité d'un agent"""
+        with self.lock:
+            self.active_agents.add(agent_id)
             
-        # Logger l'alerte
-        getattr(logger, level.lower())(f"Performance Alert: {message}")
-        
-    def get_alerts(self, since: Optional[float] = None) -> List[Dict[str, Any]]:
-        """Récupère les alertes récentes"""
-        if since is None:
-            return self.alerts[-10:]  # 10 dernières
+    def record_admin_login(self):
+        """Enregistre une connexion admin"""
+        with self.lock:
+            self.admin_logins += 1
             
-        return [alert for alert in self.alerts if alert['timestamp'] >= since]
+    def get_metrics(self) -> Dict[str, Any]:
+        """Retourne les métriques"""
+        with self.lock:
+            avg_response_time = sum(self.response_times) / len(self.response_times) if self.response_times else 0
+            
+            return {
+                "uptime": time.time() - self.start_time,
+                "requests_total": self.requests_total,
+                "requests_success": self.requests_success,
+                "requests_failed": self.requests_failed,
+                "requests_rate_limited": self.requests_rate_limited,
+                "avg_response_time": avg_response_time,
+                "active_agents": list(self.active_agents),
+                "admin_logins": self.admin_logins
+            }
 
-class EzraxServerManager:
-    """Gestionnaire principal du serveur EZRAX"""
+class QuietWSGIRequestHandler(WSGIRequestHandler):
+    """Handler WSGI silencieux pour réduire les logs verbeux"""
     
-    def __init__(self, config_file="server_config.json"):
-        """Initialisation du gestionnaire de serveur"""
-        # Configuration
-        self.config_manager = EzraxServerConfig(config_file)
-        self.config = self.config_manager.config
+    def log_request(self, code='-', size='-'):
+        # Ne loguer que les erreurs
+        if isinstance(code, int) and code >= 400:
+            super().log_request(code, size)
+
+class EzraxServerAPI:
+    """
+    API REST sécurisée pour le serveur central EZRAX
+    """
+    
+    def __init__(self, db_manager, host="0.0.0.0", port=5000, api_key=None, 
+                 enable_admin_api=True, jwt_secret=None):
+        """
+        Initialisation de l'API
+        """
+        self.db_manager = db_manager
+        self.host = host
+        self.port = port
+        self.api_key = api_key or secrets.token_urlsafe(32)
+        self.jwt_secret = jwt_secret or secrets.token_urlsafe(32)
+        self.enable_admin_api = enable_admin_api
         
         # État du serveur
-        self.running = False
-        self.start_time = time.time()
+        self.is_running = False
+        self.server = None
+        self.server_thread = None
         
-        # Composants
-        self.db_manager = None
-        self.api_server = None
-        self.gui_app = None
-        self.performance_monitor = None
-        
-        # Configuration du logging avancé
-        self._setup_logging()
-        
-        # Signaux de fermeture
-        self._setup_signal_handlers()
-        
-        logger.info("=" * 60)
-        logger.info("EZRAX Central Server v2.0 - Initialisation")
-        logger.info("=" * 60)
-        
-    def _setup_logging(self):
-        """Configure le système de logging avancé"""
-        log_config = self.config["logging"]
-        
-        # Niveau de log
-        log_level = getattr(logging, log_config["level"], logging.INFO)
-        
-        # Formateur
-        formatter = logging.Formatter(
-            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-        )
-        
-        # Handler fichier avec rotation
-        from logging.handlers import RotatingFileHandler
-        file_handler = RotatingFileHandler(
-            log_config["file"],
-            maxBytes=log_config["max_size"],
-            backupCount=log_config["backup_count"]
-        )
-        file_handler.setLevel(log_level)
-        file_handler.setFormatter(formatter)
-        
-        # Configurer le logger racine
-        root_logger = logging.getLogger()
-        root_logger.handlers.clear()
-        root_logger.addHandler(file_handler)
-        
-        # Handler console optionnel
-        if log_config["console_enabled"]:
-            console_handler = logging.StreamHandler()
-            console_handler.setLevel(log_level)
-            console_handler.setFormatter(formatter)
-            root_logger.addHandler(console_handler)
-            
-        root_logger.setLevel(log_level)
-        
-        logger.info(f"Logging configuré: niveau {log_config['level']}, fichier {log_config['file']}")
-        
-    def _setup_signal_handlers(self):
-        """Configure les gestionnaires de signaux"""
-        def signal_handler(sig, frame):
-            signal_name = signal.Signals(sig).name
-            logger.info(f"Signal {signal_name} reçu, arrêt gracieux...")
-            self.stop()
-            sys.exit(0)
-            
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
-        
-        if hasattr(signal, 'SIGHUP'):
-            def reload_handler(sig, frame):
-                logger.info("Signal SIGHUP reçu, rechargement de la configuration...")
-                self._reload_config()
-                
-            signal.signal(signal.SIGHUP, reload_handler)
-            
-    def _reload_config(self):
-        """Recharge la configuration à chaud"""
-        try:
-            old_config = self.config.copy()
-            self.config_manager = EzraxServerConfig(self.config_manager.config_file)
-            self.config = self.config_manager.config
-            
-            # Reconfigurer le logging si nécessaire
-            if old_config["logging"] != self.config["logging"]:
-                self._setup_logging()
-                
-            logger.info("Configuration rechargée avec succès")
-            
-        except Exception as e:
-            logger.error(f"Erreur lors du rechargement de la configuration: {e}")
-            
-    def initialize_components(self):
-        """Initialise tous les composants du serveur"""
-        try:
-            # 1. Base de données
-            logger.info("Initialisation de la base de données...")
-            self.db_manager = ServerDatabaseManager(
-                db_path=self.config["database"]["path"]
-            )
-            logger.info("✓ Base de données initialisée")
-            
-            # 2. Serveur API
-            logger.info("Initialisation du serveur API...")
-            self.api_server = EzraxServerAPI(
-                db_manager=self.db_manager,
-                host=self.config["server"]["host"],
-                port=self.config["server"]["port"],
-                api_key=self.config["security"]["api_key"],
-                enable_admin_api=self.config["security"]["admin_api_enabled"],
-                jwt_secret=self.config["security"]["jwt_secret"]
-            )
-            logger.info("✓ Serveur API initialisé")
-            
-            # 3. Monitoring de performance
-            if self.config["monitoring"]["metrics_enabled"]:
-                logger.info("Initialisation du monitoring de performance...")
-                self.performance_monitor = PerformanceMonitor(
-                    self, 
-                    self.config["monitoring"]["health_check_interval"]
-                )
-                logger.info("✓ Monitoring de performance initialisé")
-                
-            logger.info("Tous les composants ont été initialisés avec succès")
-            
-        except Exception as e:
-            logger.error(f"Erreur lors de l'initialisation des composants: {e}")
-            raise
-            
-    def start_console_mode(self):
-        """Démarre le serveur en mode console"""
-        logger.info("Démarrage en mode console")
-        
-        # Démarrer les composants
-        self._start_components()
-        
-        # Afficher les informations de démarrage
-        self._display_startup_info()
-        
-        # Boucle principale console
-        self._console_main_loop()
-        
-    def start_gui_mode(self):
-        """Démarre le serveur en mode interface graphique"""
-        logger.info("Démarrage en mode interface graphique")
-        
-        try:
-            import tkinter as tk
-            
-            # Créer la fenêtre principale
-            root = tk.Tk()
-            
-            # Démarrer les composants en arrière-plan
-            self._start_components_async()
-            
-            # Créer l'interface graphique
-            self.gui_app = EzraxServerGUI(root, self.db_manager, self.api_server)
-            
-            # Configurer la fermeture
-            root.protocol("WM_DELETE_WINDOW", self._on_gui_closing)
-            
-            # Démarrer la boucle GUI
-            root.mainloop()
-            
-        except ImportError:
-            logger.error("Tkinter non disponible, passage en mode console")
-            self.start_console_mode()
-        except Exception as e:
-            logger.error(f"Erreur lors du démarrage de l'interface graphique: {e}")
-            self.start_console_mode()
-            
-    def _start_components(self):
-        """Démarre tous les composants"""
-        self.running = True
-        
-        try:
-            # Démarrer le monitoring
-            if self.performance_monitor:
-                self.performance_monitor.start()
-                
-            # Démarrer l'API dans le thread principal
-            logger.info("Démarrage du serveur API...")
-            
-            # Afficher les informations importantes
-            self._log_security_info()
-            
-            # Démarrer l'API (bloquant)
-            self.api_server.start()
-            
-        except Exception as e:
-            logger.error(f"Erreur lors du démarrage des composants: {e}")
-            self.stop()
-            raise
-            
-    def _start_components_async(self):
-        """Démarre les composants en mode asynchrone pour la GUI"""
-        self.running = True
-        
-        # Démarrer le monitoring
-        if self.performance_monitor:
-            self.performance_monitor.start()
-            
-        # Démarrer l'API dans un thread séparé
-        api_thread = threading.Thread(
-            target=self.api_server.start,
-            name="APIServer",
-            daemon=True
-        )
-        api_thread.start()
-        
-        # Afficher les informations de sécurité
-        self._log_security_info()
-        
-        logger.info("Composants démarrés en mode asynchrone")
-        
-    def _log_security_info(self):
-        """Affiche les informations de sécurité importantes"""
-        logger.info("=" * 50)
-        logger.info("INFORMATIONS DE SÉCURITÉ")
-        logger.info("=" * 50)
-        
-        api_key = self.config["security"]["api_key"]
-        logger.info(f"Clé API: {api_key[:8]}...{api_key[-4:]}")
-        
-        if self.config["security"]["admin_api_enabled"]:
-            logger.warning("API d'administration ACTIVÉE")
-            logger.warning("Assurez-vous de configurer des mots de passe forts pour les admins")
-        else:
-            logger.info("API d'administration DÉSACTIVÉE")
-            
-        logger.info(f"Serveur accessible sur: http://{self.config['server']['host']}:{self.config['server']['port']}")
-        logger.info("=" * 50)
-        
-    def _display_startup_info(self):
-        """Affiche les informations de démarrage"""
-        print("\n" + "=" * 60)
-        print("🛡️  EZRAX Central Server v2.0 - DÉMARRÉ")
-        print("=" * 60)
-        print(f"🌐 Serveur API: http://{self.config['server']['host']}:{self.config['server']['port']}")
-        print(f"🔑 Clé API: {self.config['security']['api_key'][:8]}...")
-        print(f"📊 Admin API: {'✅ Activé' if self.config['security']['admin_api_enabled'] else '❌ Désactivé'}")
-        print(f"💾 Base de données: {self.config['database']['path']}")
-        print(f"📝 Logs: {self.config['logging']['file']}")
-        print("=" * 60)
-        print("Commandes disponibles:")
-        print("  📊 stats    - Afficher les statistiques")
-        print("  👥 agents   - Lister les agents connectés")
-        print("  🚨 alerts   - Afficher les alertes")
-        print("  🔄 reload   - Recharger la configuration")
-        print("  ❌ quit     - Arrêter le serveur")
-        print("=" * 60)
-        
-    def _console_main_loop(self):
-        """Boucle principale en mode console"""
-        try:
-            while self.running:
-                try:
-                    command = input("\nezrax-server> ").strip().lower()
-                    
-                    if command in ['quit', 'exit', 'q']:
-                        break
-                    elif command == 'stats':
-                        self._show_stats()
-                    elif command == 'agents':
-                        self._show_agents()
-                    elif command == 'alerts':
-                        self._show_alerts()
-                    elif command == 'reload':
-                        self._reload_config()
-                    elif command == 'help':
-                        self._show_help()
-                    elif command == '':
-                        continue
-                    else:
-                        print(f"Commande inconnue: {command}. Tapez 'help' pour l'aide.")
-                        
-                except KeyboardInterrupt:
-                    print("\nUtilisez 'quit' pour arrêter le serveur proprement.")
-                except EOFError:
-                    break
-                    
-        except Exception as e:
-            logger.error(f"Erreur dans la boucle console: {e}")
-        finally:
-            self.stop()
-            
-    def _show_stats(self):
-        """Affiche les statistiques du serveur"""
-        try:
-            print("\n📊 STATISTIQUES DU SERVEUR")
-            print("=" * 40)
-            
-            # Uptime
-            uptime = time.time() - self.start_time
-            uptime_str = self._format_duration(uptime)
-            print(f"⏱️  Uptime: {uptime_str}")
-            
-            # Stats globales
-            if self.db_manager:
-                global_stats = self.db_manager.get_global_stats()
-                print(f"👥 Agents: {global_stats['total_agents']} total, {global_stats['active_agents']} actifs")
-                print(f"🚨 Attaques: {global_stats['total_attacks']} total")
-                print(f"🚫 IPs bloquées: {global_stats['blocked_ips']}")
-                
-            # Stats API
-            if self.api_server:
-                api_metrics = self.api_server.get_api_metrics()
-                api_stats = api_metrics['api_metrics']
-                print(f"🌐 Requêtes API: {api_stats['requests_total']} total, {api_stats['requests_success']} réussies")
-                print(f"⚡ Temps de réponse moyen: {api_stats['avg_response_time']*1000:.0f}ms")
-                
-            # Stats DB
-            if self.db_manager:
-                db_metrics = self.db_manager.get_performance_metrics()
-                print(f"💾 Requêtes DB: {db_metrics['queries_executed']}")
-                print(f"🎯 Cache hit rate: {db_metrics['query_cache']['hit_rate']:.1%}")
-                
-        except Exception as e:
-            print(f"Erreur lors de l'affichage des statistiques: {e}")
-            
-    def _show_agents(self):
-        """Affiche la liste des agents"""
-        try:
-            print("\n👥 AGENTS CONNECTÉS")
-            print("=" * 40)
-            
-            if self.db_manager:
-                agents = self.db_manager.get_agents()
-                
-                if not agents:
-                    print("Aucun agent enregistré")
-                    return
-                    
-                for agent in agents:
-                    status_emoji = "🟢" if agent['status'] == 'online' else "🔴"
-                    print(f"{status_emoji} {agent['hostname']} ({agent['ip_address']})")
-                    print(f"   ID: {agent['agent_id']}")
-                    
-                    if agent['last_seen']:
-                        last_seen = time.time() - agent['last_seen']
-                        last_seen_str = self._format_duration(last_seen)
-                        print(f"   Dernière activité: il y a {last_seen_str}")
-                        
-                    print()
-                    
-        except Exception as e:
-            print(f"Erreur lors de l'affichage des agents: {e}")
-            
-    def _show_alerts(self):
-        """Affiche les alertes récentes"""
-        try:
-            print("\n🚨 ALERTES RÉCENTES")
-            print("=" * 40)
-            
-            if self.performance_monitor:
-                alerts = self.performance_monitor.get_alerts()
-                
-                if not alerts:
-                    print("Aucune alerte récente")
-                    return
-                    
-                for alert in alerts[-10:]:  # 10 dernières
-                    level_emoji = {"INFO": "ℹ️", "WARNING": "⚠️", "ERROR": "❌"}.get(alert['level'], "📝")
-                    alert_time = time.strftime('%H:%M:%S', time.localtime(alert['timestamp']))
-                    print(f"{level_emoji} [{alert_time}] {alert['message']}")
-                    
-        except Exception as e:
-            print(f"Erreur lors de l'affichage des alertes: {e}")
-            
-    def _show_help(self):
-        """Affiche l'aide des commandes"""
-        print("\n📚 AIDE DES COMMANDES")
-        print("=" * 40)
-        print("stats    - Afficher les statistiques du serveur")
-        print("agents   - Lister les agents connectés")
-        print("alerts   - Afficher les alertes de performance")
-        print("reload   - Recharger la configuration")
-        print("help     - Afficher cette aide")
-        print("quit     - Arrêter le serveur proprement")
-        
-    def _format_duration(self, seconds: float) -> str:
-        """Formate une durée en chaîne lisible"""
-        if seconds < 60:
-            return f"{seconds:.0f}s"
-        elif seconds < 3600:
-            return f"{seconds/60:.0f}m {seconds%60:.0f}s"
-        elif seconds < 86400:
-            hours = seconds // 3600
-            minutes = (seconds % 3600) // 60
-            return f"{hours:.0f}h {minutes:.0f}m"
-        else:
-            days = seconds // 86400
-            hours = (seconds % 86400) // 3600
-            return f"{days:.0f}j {hours:.0f}h"
-            
-    def _on_gui_closing(self):
-        """Gère la fermeture de l'interface graphique"""
-        if self.gui_app:
-            self.gui_app.on_closing()
-        self.stop()
-        
-    def stop(self):
-        """Arrête proprement le serveur"""
-        if not self.running:
-            return
-            
-        logger.info("Arrêt du serveur EZRAX...")
-        self.running = False
-        
-        # Arrêter les composants dans l'ordre inverse
-        if self.performance_monitor:
-            self.performance_monitor.stop()
-            
-        if self.api_server:
-            self.api_server.stop()
-            
-        if self.db_manager:
-            self.db_manager.close()
-            
-        logger.info("Serveur EZRAX arrêté proprement")
-        
-    def get_status(self) -> Dict[str, Any]:
-        """Retourne le statut complet du serveur"""
-        status = {
-            "running": self.running,
-            "start_time": self.start_time,
-            "uptime": time.time() - self.start_time,
-            "config": {
-                "host": self.config["server"]["host"],
-                "port": self.config["server"]["port"],
-                "admin_api": self.config["security"]["admin_api_enabled"]
-            },
-            "components": {
-                "database": self.db_manager is not None,
-                "api_server": self.api_server is not None and self.api_server.is_running,
-                "gui": self.gui_app is not None,
-                "monitoring": self.performance_monitor is not None
-            }
+        # Métriques et rate limiting
+        self.metrics = APIMetrics()
+        self.rate_limiters = {
+            "agents": RateLimiter(1000, 60),      # 1000 req/min pour agents
+            "admin": RateLimiter(200, 60),        # 200 req/min pour admin
+            "public": RateLimiter(50, 60)         # 50 req/min pour public
         }
         
-        # Ajouter les métriques si disponibles
-        if self.db_manager:
-            status["database_metrics"] = self.db_manager.get_performance_metrics()
+        # Créer l'application Flask
+        self.app = self._create_app()
+        
+        logger.info(f"API EZRAX initialisée sur {host}:{port}")
+        
+    def _create_app(self) -> Flask:
+        """Crée l'application Flask avec toutes les routes"""
+        app = Flask(__name__)
+        app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max
+        
+        # Configuration JSON
+        app.json.ensure_ascii = False
+        app.json.sort_keys = False
+        
+        # Middleware de métriques
+        @app.before_request
+        def before_request():
+            g.start_time = time.time()
             
-        if self.api_server:
-            status["api_metrics"] = self.api_server.get_api_metrics()
+        @app.after_request
+        def after_request(response):
+            # Enregistrer les métriques
+            response_time = time.time() - g.start_time
+            success = 200 <= response.status_code < 400
+            rate_limited = response.status_code == 429
             
-        return status
-
-def parse_arguments():
-    """Parse les arguments de la ligne de commande"""
-    parser = argparse.ArgumentParser(description="Serveur central EZRAX IDS/IPS v2.0")
-    
-    parser.add_argument(
-        "--config",
-        help="Fichier de configuration",
-        default="server_config.json"
-    )
-    
-    parser.add_argument(
-        "--host",
-        help="Adresse d'écoute de l'API",
-        default=None
-    )
-    
-    parser.add_argument(
-        "--port",
-        help="Port d'écoute de l'API",
-        type=int,
-        default=None
-    )
-    
-    parser.add_argument(
-        "--no-gui",
-        help="Désactiver l'interface graphique",
-        action="store_true"
-    )
-    
-    parser.add_argument(
-        "--debug",
-        help="Activer le mode debug",
-        action="store_true"
-    )
-    
-    parser.add_argument(
-        "--api-key",
-        help="Clé API personnalisée",
-        default=None
-    )
-    
-    parser.add_argument(
-        "--daemon",
-        help="Lancer en mode daemon (console seulement)",
-        action="store_true"
-    )
-    
-    return parser.parse_args()
+            self.metrics.record_request(success, response_time, rate_limited)
+            
+            # Headers CORS sécurisés
+            response.headers['Access-Control-Allow-Origin'] = '*'
+            response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE'
+            response.headers['Access-Control-Allow-Headers'] = 'Content-Type, X-API-Key, Authorization'
+            
+            return response
+            
+        # Gestionnaire d'erreurs global
+        @app.errorhandler(Exception)
+        def handle_exception(e):
+            logger.error(f"Erreur API non gérée: {e}")
+            logger.error(traceback.format_exc())
+            
+            if isinstance(e, (BadRequest, Unauthorized, Forbidden, NotFound, TooManyRequests)):
+                return jsonify({"success": False, "error": str(e)}), e.code
+                
+            return jsonify({
+                "success": False, 
+                "error": "Erreur interne du serveur"
+            }), 500
+            
+        # Routes API principales
+        self._register_agent_routes(app)
+        if self.enable_admin_api:
+            self._register_admin_routes(app)
+        self._register_public_routes(app)
+        
+        return app
+        
+    def _register_agent_routes(self, app):
+        """Enregistre les routes pour les agents"""
+        
+        @app.route('/api/agents/register', methods=['POST'])
+        @self._require_api_key
+        @self._rate_limit("agents")
+        def register_agent():
+            """Enregistre un agent"""
+            try:
+                data = request.get_json()
+                if not data:
+                    abort(400, "Données JSON requises")
+                    
+                # Validation des données requises
+                required_fields = ["agent_id", "hostname", "ip_address"]
+                for field in required_fields:
+                    if field not in data or not data[field]:
+                        abort(400, f"Champ requis manquant: {field}")
+                        
+                # Validation UUID pour agent_id
+                try:
+                    import uuid
+                    uuid.UUID(data["agent_id"])
+                except ValueError:
+                    abort(400, "agent_id doit être un UUID valide")
+                    
+                # Enregistrer l'agent
+                success = self.db_manager.register_agent(data)
+                
+                if success:
+                    self.metrics.record_agent_activity(data["agent_id"])
+                    
+                    # Récupérer les commandes en attente
+                    pending_commands = self.db_manager.get_pending_commands(data["agent_id"])
+                    
+                    return jsonify({
+                        "success": True,
+                        "message": "Agent enregistré avec succès",
+                        "commands": pending_commands,
+                        "server_time": time.time()
+                    })
+                else:
+                    abort(500, "Erreur lors de l'enregistrement de l'agent")
+                    
+            except Exception as e:
+                logger.error(f"Erreur enregistrement agent: {e}")
+                abort(500, "Erreur interne")
+                
+        @app.route('/api/agents/<agent_id>/sync', methods=['POST'])
+        @self._require_api_key
+        @self._rate_limit("agents")
+        def sync_agent(agent_id):
+            """Synchronise les données d'un agent"""
+            try:
+                data = request.get_json() or {}
+                
+                # Mettre à jour le statut de l'agent
+                agent_stats = data.get("agent_stats", {})
+                health_metrics = data.get("health_metrics", {})
+                health_score = health_metrics.get("connection_health", 1.0)
+                
+                self.db_manager.update_agent_status(
+                    agent_id, 
+                    "online", 
+                    request.remote_addr,
+                    health_score
+                )
+                
+                # Traiter les logs d'attaques
+                attack_logs = data.get("attack_logs", [])
+                if attack_logs:
+                    count = self.db_manager.add_attack_logs(attack_logs)
+                    logger.info(f"Agent {agent_id}: {count} logs d'attaques synchronisés")
+                    
+                # Traiter les IPs bloquées
+                blocked_ips = data.get("blocked_ips", [])
+                if blocked_ips:
+                    count = self.db_manager.add_blocked_ips(blocked_ips)
+                    logger.info(f"Agent {agent_id}: {count} IPs bloquées synchronisées")
+                    
+                self.metrics.record_agent_activity(agent_id)
+                
+                # Récupérer les commandes en attente
+                pending_commands = self.db_manager.get_pending_commands(agent_id)
+                
+                # Récupérer la liste blanche mise à jour
+                whitelist = self.db_manager.get_whitelist()
+                
+                return jsonify({
+                    "success": True,
+                    "commands": pending_commands,
+                    "whitelist": whitelist,
+                    "server_time": time.time()
+                })
+                
+            except Exception as e:
+                logger.error(f"Erreur synchronisation agent {agent_id}: {e}")
+                abort(500, "Erreur lors de la synchronisation")
+                
+        @app.route('/api/agents/<agent_id>/heartbeat', methods=['POST'])
+        @self._require_api_key
+        @self._rate_limit("agents")
+        def agent_heartbeat(agent_id):
+            """Heartbeat d'un agent"""
+            try:
+                data = request.get_json() or {}
+                
+                status = data.get("status", "online")
+                health_score = data.get("health_score", 1.0)
+                
+                # Mettre à jour le statut
+                self.db_manager.update_agent_status(
+                    agent_id, 
+                    status, 
+                    request.remote_addr,
+                    health_score
+                )
+                
+                self.metrics.record_agent_activity(agent_id)
+                
+                return jsonify({
+                    "success": True,
+                    "server_time": time.time()
+                })
+                
+            except Exception as e:
+                logger.error(f"Erreur heartbeat agent {agent_id}: {e}")
+                abort(500, "Erreur lors du heartbeat")
+                
+        @app.route('/api/agents/<agent_id>/commands/<int:command_id>/ack', methods=['POST'])
+        @self._require_api_key
+        @self._rate_limit("agents")
+        def acknowledge_command(agent_id, command_id):
+            """Accusé de réception d'une commande"""
+            try:
+                data = request.get_json() or {}
+                success = data.get("success", True)
+                
+                status = "executed" if success else "failed"
+                self.db_manager.update_command_status(command_id, status)
+                
+                return jsonify({"success": True})
+                
+            except Exception as e:
+                logger.error(f"Erreur ACK commande {command_id}: {e}")
+                abort(500, "Erreur lors de l'accusé de réception")
+                
+    def _register_admin_routes(self, app):
+        """Enregistre les routes d'administration"""
+        
+        @app.route('/api/admin/login', methods=['POST'])
+        @self._rate_limit("admin")
+        def admin_login():
+            """Connexion administrateur"""
+            try:
+                data = request.get_json()
+                if not data:
+                    abort(400, "Données JSON requises")
+                    
+                username = data.get("username")
+                password = data.get("password")
+                
+                if not username or not password:
+                    abort(400, "Nom d'utilisateur et mot de passe requis")
+                    
+                # Authentifier l'administrateur
+                session_id = self.db_manager.admin_manager.authenticate_admin(username, password)
+                
+                if session_id:
+                    # Générer un token JWT
+                    payload = {
+                        "session_id": session_id,
+                        "username": username,
+                        "exp": datetime.utcnow() + timedelta(hours=8),
+                        "iat": datetime.utcnow()
+                    }
+                    
+                    token = jwt.encode(payload, self.jwt_secret, algorithm="HS256")
+                    
+                    self.metrics.record_admin_login()
+                    
+                    return jsonify({
+                        "success": True,
+                        "token": token,
+                        "expires_in": 28800  # 8 heures
+                    })
+                else:
+                    abort(401, "Nom d'utilisateur ou mot de passe incorrect")
+                    
+            except Exception as e:
+                logger.error(f"Erreur connexion admin: {e}")
+                abort(500, "Erreur lors de la connexion")
+                
+        @app.route('/api/admin/dashboard', methods=['GET'])
+        @self._require_admin_auth
+        @self._rate_limit("admin")
+        def admin_dashboard():
+            """Tableau de bord administrateur"""
+            try:
+                # Statistiques globales
+                global_stats = self.db_manager.get_global_stats()
+                
+                # Métriques API
+                api_metrics = self.metrics.get_metrics()
+                
+                # Performance de la base de données
+                db_metrics = self.db_manager.get_performance_metrics()
+                
+                return jsonify({
+                    "success": True,
+                    "data": {
+                        "global_stats": global_stats,
+                        "api_metrics": api_metrics,
+                        "db_performance": db_metrics,
+                        "server_info": {
+                            "version": "2.0.0",
+                            "host": self.host,
+                            "port": self.port,
+                            "uptime": time.time() - self.metrics.start_time
+                        }
+                    }
+                })
+                
+            except Exception as e:
+                logger.error(f"Erreur dashboard admin: {e}")
+                abort(500, "Erreur lors du chargement du dashboard")
+                
+        @app.route('/api/admin/agents', methods=['GET'])
+        @self._require_admin_auth
+        @self._rate_limit("admin")
+        def admin_list_agents():
+            """Liste des agents pour l'admin"""
+            try:
+                include_offline = request.args.get('include_offline', 'true').lower() == 'true'
+                agents = self.db_manager.get_agents(include_offline=include_offline)
+                
+                return jsonify({
+                    "success": True,
+                    "data": agents
+                })
+                
+            except Exception as e:
+                logger.error(f"Erreur liste agents admin: {e}")
+                abort(500, "Erreur lors du chargement des agents")
+                
+        @app.route('/api/admin/attacks', methods=['GET'])
+        @self._require_admin_auth
+        @self._rate_limit("admin")
+        def admin_list_attacks():
+            """Liste des attaques pour l'admin"""
+            try:
+                limit = min(int(request.args.get('limit', 100)), 1000)
+                offset = int(request.args.get('offset', 0))
+                
+                # Filtres optionnels
+                since = request.args.get('since')
+                if since:
+                    since = float(since)
+                    
+                attack_type = request.args.get('attack_type')
+                agent_id = request.args.get('agent_id')
+                source_ip = request.args.get('source_ip')
+                
+                attacks = self.db_manager.get_attack_logs(
+                    limit=limit,
+                    offset=offset,
+                    since=since,
+                    attack_type=attack_type,
+                    agent_id=agent_id,
+                    source_ip=source_ip
+                )
+                
+                return jsonify({
+                    "success": True,
+                    "data": attacks,
+                    "pagination": {
+                        "limit": limit,
+                        "offset": offset,
+                        "count": len(attacks)
+                    }
+                })
+                
+            except Exception as e:
+                logger.error(f"Erreur liste attaques admin: {e}")
+                abort(500, "Erreur lors du chargement des attaques")
+                
+        @app.route('/api/admin/commands', methods=['POST'])
+        @self._require_admin_auth
+        @self._rate_limit("admin")
+        def admin_send_command():
+            """Envoie une commande via l'admin"""
+            try:
+                data = request.get_json()
+                if not data:
+                    abort(400, "Données JSON requises")
+                    
+                agent_id = data.get("agent_id")
+                command_type = data.get("command_type")
+                command_data = data.get("command_data")
+                priority = data.get("priority", 1)
+                
+                if not agent_id or not command_type:
+                    abort(400, "agent_id et command_type requis")
+                    
+                # Obtenir l'utilisateur depuis le token
+                username = g.get("admin_username", "admin")
+                
+                command_id = self.db_manager.add_command(
+                    agent_id, command_type, command_data, username, priority
+                )
+                
+                if command_id:
+                    return jsonify({
+                        "success": True,
+                        "command_id": command_id,
+                        "message": "Commande envoyée avec succès"
+                    })
+                else:
+                    abort(500, "Erreur lors de l'envoi de la commande")
+                    
+            except Exception as e:
+                logger.error(f"Erreur envoi commande admin: {e}")
+                abort(500, "Erreur lors de l'envoi de la commande")
+                
+    def _register_public_routes(self, app):
+        """Enregistre les routes publiques"""
+        
+        @app.route('/', methods=['GET'])
+        def root():
+            """Page d'accueil de l'API"""
+            return jsonify({
+                "service": "EZRAX Central Server API",
+                "version": "2.0.0",
+                "status": "online",
+                "endpoints": {
+                    "agents": "/api/agents/",
+                    "admin": "/api/admin/" if self.enable_admin_api else None,
+                    "health": "/api/health",
+                    "metrics": "/api/metrics"
+                }
+            })
+            
+        @app.route('/api/health', methods=['GET'])
+        @self._rate_limit("public")
+        def health_check():
+            """Vérification de santé"""
+            try:
+                # Test basique de la base de données
+                agents_count = len(self.db_manager.get_agents())
+                
+                return jsonify({
+                    "success": True,
+                    "status": "healthy",
+                    "timestamp": time.time(),
+                    "agents_connected": agents_count,
+                    "uptime": time.time() - self.metrics.start_time
+                })
+                
+            except Exception as e:
+                logger.error(f"Erreur health check: {e}")
+                return jsonify({
+                    "success": False,
+                    "status": "unhealthy",
+                    "error": str(e)
+                }), 500
+                
+        @app.route('/api/metrics', methods=['GET'])
+        @self._rate_limit("public")
+        def public_metrics():
+            """Métriques publiques"""
+            try:
+                metrics = self.metrics.get_metrics()
+                
+                # Métriques publiques seulement
+                public_metrics = {
+                    "uptime": metrics["uptime"],
+                    "requests_total": metrics["requests_total"],
+                    "avg_response_time": metrics["avg_response_time"],
+                    "active_agents_count": len(metrics["active_agents"])
+                }
+                
+                return jsonify({
+                    "success": True,
+                    "data": public_metrics
+                })
+                
+            except Exception as e:
+                logger.error(f"Erreur métriques publiques: {e}")
+                abort(500, "Erreur lors du chargement des métriques")
+                
+    def _require_api_key(self, f):
+        """Décorateur pour vérifier la clé API"""
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            api_key = request.headers.get('X-API-Key')
+            
+            if not api_key:
+                logger.warning(f"Tentative d'accès sans clé API depuis {request.remote_addr}")
+                abort(401, "Clé API requise")
+                
+            # Comparaison sécurisée des clés
+            if not secrets.compare_digest(api_key, self.api_key):
+                logger.warning(f"Tentative d'accès avec clé API invalide depuis {request.remote_addr}:{api_key}")
+                abort(401, "Clé API invalide")
+                
+            return f(*args, **kwargs)
+        return decorated_function
+        
+    def _require_admin_auth(self, f):
+        """Décorateur pour vérifier l'authentification admin"""
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            auth_header = request.headers.get('Authorization')
+            
+            if not auth_header or not auth_header.startswith('Bearer '):
+                abort(401, "Token d'authentification requis")
+                
+            token = auth_header.split(' ')[1]
+            
+            try:
+                payload = jwt.decode(token, self.jwt_secret, algorithms=["HS256"])
+                session_id = payload.get("session_id")
+                username = payload.get("username")
+                
+                # Valider la session
+                session = self.db_manager.admin_manager.validate_session(session_id)
+                if not session:
+                    abort(401, "Session expirée")
+                    
+                # Stocker les infos dans g
+                g.admin_session_id = session_id
+                g.admin_username = username
+                
+            except jwt.ExpiredSignatureError:
+                abort(401, "Token expiré")
+            except jwt.InvalidTokenError:
+                abort(401, "Token invalide")
+                
+            return f(*args, **kwargs)
+        return decorated_function
+        
+    def _rate_limit(self, limiter_type):
+        """Décorateur pour le rate limiting"""
+        def decorator(f):
+            @wraps(f)
+            def decorated_function(*args, **kwargs):
+                if limiter_type in self.rate_limiters:
+                    limiter = self.rate_limiters[limiter_type]
+                    client_id = request.remote_addr
+                    
+                    if not limiter.is_allowed(client_id):
+                        abort(429, "Trop de requêtes")
+                        
+                return f(*args, **kwargs)
+            return decorated_function
+        return decorator
+        
+    def start(self):
+        """Démarre le serveur API"""
+        if self.is_running:
+            logger.warning("Le serveur API est déjà en cours d'exécution")
+            return
+            
+        try:
+            self.server = make_server(
+                self.host, 
+                self.port, 
+                self.app,
+                request_handler=QuietWSGIRequestHandler,
+                threaded=True
+            )
+            
+            self.is_running = True
+            
+            logger.info(f"Serveur API EZRAX démarré sur http://{self.host}:{self.port}")
+            logger.info(f"API Key: {self.api_key[:8]}...{self.api_key[-4:]}")
+            
+            # Démarrer le serveur (bloquant)
+            self.server.serve_forever()
+            
+        except OSError as e:
+            if e.errno == 98:  # Address already in use
+                logger.error(f"Port {self.port} déjà utilisé")
+            else:
+                logger.error(f"Erreur lors du démarrage du serveur API: {e}")
+            self.is_running = False
+            raise
+        except Exception as e:
+            logger.error(f"Erreur lors du démarrage du serveur API: {e}")
+            self.is_running = False
+            raise
+            
+    def start_async(self):
+        """Démarre le serveur API en mode asynchrone"""
+        if self.is_running:
+            return
+            
+        self.server_thread = threading.Thread(target=self.start, daemon=True)
+        self.server_thread.start()
+        
+        # Attendre que le serveur soit prêt
+        max_wait = 10
+        for _ in range(max_wait * 10):
+            if self.is_running:
+                break
+            time.sleep(0.1)
+        else:
+            raise RuntimeError("Le serveur n'a pas pu démarrer dans le délai imparti")
+            
+    def stop(self):
+        """Arrête le serveur API"""
+        if not self.is_running:
+            return
+            
+        logger.info("Arrêt du serveur API...")
+        
+        if self.server:
+            self.server.shutdown()
+            
+        self.is_running = False
+        
+        if self.server_thread and self.server_thread.is_alive():
+            self.server_thread.join(timeout=5)
+            
+        logger.info("Serveur API arrêté")
+        
+    def get_api_metrics(self) -> Dict[str, Any]:
+        """Retourne les métriques complètes de l'API"""
+        return {
+            "api_metrics": self.metrics.get_metrics(),
+            "rate_limiters": {
+                name: limiter.get_stats() 
+                for name, limiter in self.rate_limiters.items()
+            },
+            "server_info": {
+                "host": self.host,
+                "port": self.port,
+                "is_running": self.is_running,
+                "admin_api_enabled": self.enable_admin_api
+            }
+        }
 
 def main():
-    """Point d'entrée principal"""
+    """Point d'entrée principal pour les tests"""
+    from db_manager import ServerDatabaseManager
+    
+    # Configuration de test
+    db_manager = ServerDatabaseManager("test_server.db")
+    api = EzraxServerAPI(db_manager)
+    
     try:
-        # Parser les arguments
-        args = parse_arguments()
-        
-        # Créer le gestionnaire de serveur
-        server_manager = EzraxServerManager(args.config)
-        
-        # Surcharger la config avec les arguments
-        if args.host:
-            server_manager.config["server"]["host"] = args.host
-        if args.port:
-            server_manager.config["server"]["port"] = args.port
-        if args.debug:
-            server_manager.config["server"]["debug"] = True
-            server_manager.config["logging"]["level"] = "DEBUG"
-        if args.api_key:
-            server_manager.config["security"]["api_key"] = args.api_key
-            
-        # Reconfigurer le logging si debug
-        if args.debug:
-            logging.getLogger().setLevel(logging.DEBUG)
-            logger.debug("Mode debug activé")
-            
-        # Initialiser les composants
-        server_manager.initialize_components()
-        
-        # Choisir le mode de démarrage
-        if args.no_gui or args.daemon:
-            # Mode console/daemon
-            server_manager.start_console_mode()
-        else:
-            # Mode interface graphique (par défaut)
-            server_manager.start_gui_mode()
-            
+        api.start()
     except KeyboardInterrupt:
-        logger.info("Interruption clavier reçue")
-    except Exception as e:
-        logger.critical(f"Erreur critique: {e}")
-        return 1
-        
-    return 0
+        api.stop()
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

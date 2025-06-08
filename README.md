@@ -1,2 +1,1 @@
-# ezrax-project
-This is my End-Of-Year Project (PFA) for my 4th year of engineering as a cybersecurity student at ENSIASD, focusing on the development of EZRAX — an open-source distributed IDS/IPS system for securing networks in Linux environment.
+![EZRAX (1)](https://github.com/user-attachments/assets/1a321353-8d55-4607-b966-8008cabdd5a5)

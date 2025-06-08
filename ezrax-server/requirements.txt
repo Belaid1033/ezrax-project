@@ -1,0 +1,23 @@
+# EZRAX Central Server Dependencies - Python 3.8+
+
+# Core Flask Framework
+Flask==3.0.0
+Werkzeug==3.0.1
+
+# HTTP Client
+requests==2.31.0
+
+# JWT Authentication
+PyJWT==2.8.0
+
+# Image Processing (compatible Python 3.13)
+Pillow>=10.1.0
+
+# GUI Dependencies (optionnel)
+ttkthemes==3.2.2
+
+# Utilities
+python-dateutil==2.8.2
+markupsafe>=2.0.0
+itsdangerous>=2.0.0
+click>=8.0.0

@@ -127,8 +127,8 @@ ENV_FILE="$ENV_DIR/.env"
 
 echo "[*] Création du répertoire pour le fichier .env : $ENV_DIR"
 mkdir -p "$ENV_DIR"
-chown ezrax:ezrax "$ENV_FILE" # ezrax devient propriétaire
-chmod 600 "$ENV_FILE"
+chown ezrax:ezrax "$ENV_DIR" # ezrax devient propriétaire
+chmod 600 "$ENV_DIR"
 
 if [ ! -f "$ENV_FILE" ]; then
     echo "[*] Création du fichier .env par défaut : $ENV_FILE"

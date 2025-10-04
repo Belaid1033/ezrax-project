@@ -85,7 +85,7 @@ class SynFloodScanner(BaseScanner):
             interface: Nom de l'interface à surveiller
         """
         try:
-            Filtre BPF spécifique et sécurisé
+            #Filtre BPF spécifique et sécurisé
             bpf_filter = "tcp[tcpflags] & tcp-syn != 0 and tcp[tcpflags] & tcp-ack == 0 and not src host 127.0.0.1"
             
             sniff(

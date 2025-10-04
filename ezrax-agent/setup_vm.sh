@@ -127,8 +127,8 @@ ENV_FILE="$ENV_DIR/.env"
 
 echo "[*] Création du répertoire pour le fichier .env : $ENV_DIR"
 mkdir -p "$ENV_DIR"
-chown ezrax:ezrax "$ENV_DIR" # ezrax devient propriétaire
-chmod 600 "$ENV_DIR"
+chown root:ezrax "$ENV_DIR" # ezrax devient propriétaire
+chmod 750 "$ENV_DIR"
 
 if [ ! -f "$ENV_FILE" ]; then
     echo "[*] Création du fichier .env par défaut : $ENV_FILE"
@@ -140,8 +140,8 @@ CENTRAL_SERVER_API_KEY="changez_moi_en_production"
 # CENTRAL_SERVER_HOST="127.0.0.1"
 # CENTRAL_SERVER_PORT="5000"
 EOF
-    chown root:root "$ENV_FILE"
-    chmod 600 "$ENV_FILE"
+    chown root:ezrax "$ENV_FILE"
+    chmod 640 "$ENV_FILE"
     echo "[!] IMPORTANT : éditez $ENV_FILE pour y coller votre vraie clé API avant de démarrer l'agent."
 else
     echo "[*] Fichier .env existant détecté : $ENV_FILE"

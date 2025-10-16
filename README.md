@@ -144,3 +144,17 @@ sudo ezraxtl logs
 
 # Consulter le statut du serveur
 sudo ezraxtl status
+```
+
+**Sur chaque machine Agent :**
+```bash
+# Démarrer l'agent
+sudo ezraxtl-agent start
+
+# Consulter les logs de l'agent
+sudo ezraxtl-agent logs
+
+# Consulter le statut de l'agent
+sudo ezraxtl-agent status
+```
+

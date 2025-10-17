@@ -157,4 +157,6 @@ sudo ezraxtl-agent logs
 # Consulter le statut de l'agent
 sudo ezraxtl-agent status
 ```
+## 📄 Licence
+Ce projet est distribué sous la licence AGPL-3.0. Voir le fichier LICENSE pour plus d'informations.
 

@@ -45,7 +45,7 @@ Le nom **EZRAX** vient de la langue Amazighe et signifie *"il t'a vu"*, incarnan
 
 EZRAX est basé sur un modèle agent-serveur classique pour combiner détection locale et supervision centrale.
 
-![Architecture EZRAX](chemin/vers/votre/diagramme_architecture.png) <!-- Remplacez par le chemin de votre diagramme d'architecture -->
+<img width="10303" height="3655" alt="archi-all2 drawio" src="https://github.com/user-attachments/assets/e97e397b-f2b2-42ab-9acd-02263f1c1549" />
 
 1.  **Agent EZRAX :**
     - Installé sur chaque hôte à surveiller.

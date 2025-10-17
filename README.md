@@ -16,7 +16,6 @@ Le nom **EZRAX** vient de la langue Amazighe et signifie *"il t'a vu"*, incarnan
   - [Installation du Serveur](#installation-du-serveur)
   - [Installation de l'Agent](#installation-de-l-agent)
 - [Démarrage Rapide](#-démarrage-rapide)
-- [Démonstration](#-démonstration)
 - [Licence](#-licence)
 
 ---
